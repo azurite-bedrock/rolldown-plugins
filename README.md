@@ -1,2 +1,3 @@
 # rolldown-plugins
-Collection of Rolldown Plugins used by Azurite 
+
+Collection of Rolldown Plugins used by Azurite
