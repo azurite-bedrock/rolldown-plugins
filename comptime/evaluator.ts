@@ -1,5 +1,6 @@
 import { rolldown } from 'rolldown';
 import type { Plugin } from 'rolldown';
+import denoPlugin from '@deno/rolldown-plugin';
 
 export type EvaluateResult = { value: unknown; watchFiles: string[] };
 
@@ -16,7 +17,12 @@ export class RolldownEvaluator {
 
         const bundle = await rolldown({
             input: virtualId,
-            plugins: [this.#virtualPlugin(), ...innerPlugins],
+            plugins: [
+                this.#virtualPlugin(),
+                ...innerPlugins,
+                localFilesPlugin(),
+                ...[denoPlugin()].flat(),
+            ],
         }).catch((err: unknown) => {
             throw new Error(`comptime inner build failed: ${messageFrom(err)}`, {
                 cause: err,
@@ -77,6 +83,24 @@ export class RolldownEvaluator {
             },
         };
     }
+}
+
+// Load local files directly so deno-plugin's WASM loader doesn't handle them
+function localFilesPlugin(): Plugin {
+    return {
+        name: 'comptime-local-files',
+        resolveId(id) {
+            if (/^[A-Za-z]:/.test(id)) return id;
+            return null;
+        },
+        async load(id) {
+            if (/^[A-Za-z]:/.test(id)) {
+                const code = await Deno.readTextFile(id);
+                return { code, moduleType: 'ts' as const };
+            }
+            return null;
+        },
+    };
 }
 
 function messageFrom(err: unknown): string {
