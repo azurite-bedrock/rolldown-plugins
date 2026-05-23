@@ -6,12 +6,12 @@
         "./comptime/plugin": "./comptime/plugin.ts"
     },
     "imports": {
-        "@std/path": "jsr:@std/path",
-        "@std/assert": "jsr:@std/assert",
-        "@std/fs": "jsr:@std/fs",
-        "rolldown": "npm:rolldown",
-        "devalue": "npm:devalue",
-        "magic-string": "npm:magic-string",
-        "micromatch": "npm:micromatch"
+        "@std/path": "jsr:@std/path@^1.1.4",
+        "@std/assert": "jsr:@std/assert@^1.0.19",
+        "@std/fs": "jsr:@std/fs@^1.0.23",
+        "rolldown": "npm:rolldown@^1.0.2",
+        "devalue": "npm:devalue@^5.8.1",
+        "magic-string": "npm:magic-string@^0.30.21",
+        "micromatch": "npm:micromatch@^4.0.8"
     }
 }
