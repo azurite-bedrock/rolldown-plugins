@@ -40,7 +40,19 @@ export class RolldownEvaluator {
                     'comptime inner build failed: expected a single output chunk',
                 );
             }
-            const code = `${first.code}\n// __comptime_eval_${this.#evalCount++}`;
+            // virtualId is \0comptime:<absPath>?comptime=<n> — derive a file:// URL
+            // so that import.meta.url inside the bundle resolves relative paths correctly
+            const sourcePath = virtualId
+                .slice('\0comptime:'.length)
+                .replace(/\?comptime=\d+$/, '');
+            const sourceFileUrl = /^[A-Za-z]:/.test(sourcePath)
+                ? `file:///${sourcePath.replace(/\\/g, '/')}`
+                : `file://${sourcePath}`;
+            const rawCode = first.code.replace(
+                /\bimport\.meta\.url\b/g,
+                JSON.stringify(sourceFileUrl),
+            );
+            const code = `${rawCode}\n// __comptime_eval_${this.#evalCount++}`;
             const url = `data:text/javascript,${encodeURIComponent(code)}`;
             const mod = await import(url);
             return {
