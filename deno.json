@@ -1,6 +1,6 @@
 {
     "name": "@azurite/rolldown-plugins",
-    "version": "0.1.1",
+    "version": "0.1.2",
     "exports": {
         "./comptime": "./comptime/runtime.ts",
         "./comptime/plugin": "./comptime/plugin.ts"
