@@ -211,7 +211,7 @@ export function collectImportBindings(
     return bindings;
 }
 
-export type TopLevelDecl = { names: string[]; source: string };
+export type TopLevelDecl = { names: string[]; source: string; start: number; end: number };
 
 export function collectTopLevelDeclarations(program: any, code: string): TopLevelDecl[] {
     const decls: TopLevelDecl[] = [];
@@ -221,16 +221,20 @@ export function collectTopLevelDeclarations(program: any, code: string): TopLeve
             const names = node.declarations.flatMap((d: any) =>
                 extractPatternNames(d.id),
             );
-            decls.push({ names, source: code.slice(node.start, node.end) });
+            decls.push({ names, source: code.slice(node.start, node.end), start: node.start, end: node.end });
         } else if (node.type === 'FunctionDeclaration' && node.id) {
             decls.push({
                 names: [node.id.name],
                 source: code.slice(node.start, node.end),
+                start: node.start,
+                end: node.end,
             });
         } else if (node.type === 'ClassDeclaration' && node.id) {
             decls.push({
                 names: [node.id.name],
                 source: code.slice(node.start, node.end),
+                start: node.start,
+                end: node.end,
             });
         }
     }

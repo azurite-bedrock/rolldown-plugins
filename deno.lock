@@ -1,15 +1,14 @@
 {
   "version": "5",
   "specifiers": {
-    "jsr:@std/assert@*": "1.0.19",
-    "jsr:@std/fs@*": "1.0.23",
+    "jsr:@std/assert@^1.0.19": "1.0.19",
+    "jsr:@std/fs@^1.0.23": "1.0.23",
     "jsr:@std/internal@^1.0.12": "1.0.13",
-    "jsr:@std/path@*": "1.1.4",
     "jsr:@std/path@^1.1.4": "1.1.4",
-    "npm:devalue@*": "5.8.1",
-    "npm:magic-string@*": "0.30.21",
-    "npm:micromatch@*": "4.0.8",
-    "npm:rolldown@*": "1.0.2"
+    "npm:devalue@^5.8.1": "5.8.1",
+    "npm:magic-string@~0.30.21": "0.30.21",
+    "npm:micromatch@^4.0.8": "4.0.8",
+    "npm:rolldown@^1.0.2": "1.0.2"
   },
   "jsr": {
     "@std/assert@1.0.19": {
@@ -22,7 +21,7 @@
       "integrity": "3ecbae4ce4fee03b180fa710caff36bb5adb66631c46a6460aaad49515565a37",
       "dependencies": [
         "jsr:@std/internal",
-        "jsr:@std/path@^1.1.4"
+        "jsr:@std/path"
       ]
     },
     "@std/internal@1.0.13": {
@@ -228,13 +227,13 @@
   },
   "workspace": {
     "dependencies": [
-      "jsr:@std/assert@*",
-      "jsr:@std/fs@*",
-      "jsr:@std/path@*",
-      "npm:devalue@*",
-      "npm:magic-string@*",
-      "npm:micromatch@*",
-      "npm:rolldown@*"
+      "jsr:@std/assert@^1.0.19",
+      "jsr:@std/fs@^1.0.23",
+      "jsr:@std/path@^1.1.4",
+      "npm:devalue@^5.8.1",
+      "npm:magic-string@~0.30.21",
+      "npm:micromatch@^4.0.8",
+      "npm:rolldown@^1.0.2"
     ]
   }
 }

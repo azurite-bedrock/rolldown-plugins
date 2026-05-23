@@ -126,8 +126,10 @@ export function createCore(
                     const usedImports = [...importBindings.values()].filter((b) =>
                         refs.has(b.localName),
                     );
-                    const usedDecls = topLevelDecls.filter((d) =>
-                        d.names.some((n) => refs.has(n)),
+                    const usedDecls = topLevelDecls.filter(
+                        (d) =>
+                            d.names.some((n) => refs.has(n)) &&
+                            !calls.some((c) => c.start >= d.start && c.end <= d.end),
                     );
                     const virtual = createVirtualModule(
                         usedImports,
