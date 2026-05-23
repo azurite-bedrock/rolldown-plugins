@@ -1,3 +1,17 @@
 {
-    "workspace": ["./comptime"]
+    "name": "@azurite/rolldown-plugins",
+    "version": "0.1.0",
+    "exports": {
+        "./comptime": "./comptime/runtime.ts",
+        "./comptime/plugin": "./comptime/plugin.ts"
+    },
+    "imports": {
+        "@std/path": "jsr:@std/path",
+        "@std/assert": "jsr:@std/assert",
+        "@std/fs": "jsr:@std/fs",
+        "rolldown": "npm:rolldown",
+        "devalue": "npm:devalue",
+        "magic-string": "npm:magic-string",
+        "micromatch": "npm:micromatch"
+    }
 }
