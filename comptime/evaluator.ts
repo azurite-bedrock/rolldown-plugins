@@ -1,6 +1,7 @@
-import { rolldown } from 'rolldown';
-import type { Plugin } from 'rolldown';
-import denoPlugin from '@deno/rolldown-plugin';
+import { rolldown } from "rolldown";
+import type { Plugin } from "rolldown";
+import denoPlugin from "@deno/rolldown-plugin";
+import { dirname, join } from "@std/path";
 
 export type EvaluateResult = { value: unknown; watchFiles: string[] };
 
@@ -15,13 +16,16 @@ export class RolldownEvaluator {
     ): Promise<EvaluateResult> {
         this.#virtualModules.set(virtualId, virtualSource);
 
+        const sourcePath = virtualIdToSourcePath(virtualId);
+        const configPath = findDenoConfig(dirname(sourcePath));
+
         const bundle = await rolldown({
             input: virtualId,
             plugins: [
                 this.#virtualPlugin(),
                 ...innerPlugins,
                 localFilesPlugin(),
-                ...[denoPlugin()].flat(),
+                ...[denoPlugin({ configPath })].flat(),
             ],
         }).catch((err: unknown) => {
             throw new Error(`comptime inner build failed: ${messageFrom(err)}`, {
@@ -101,6 +105,39 @@ function localFilesPlugin(): Plugin {
             return null;
         },
     };
+}
+
+const configCache = new Map<string, string | undefined>();
+
+function findDenoConfig(startDir: string): string | undefined {
+    if (configCache.has(startDir)) return configCache.get(startDir);
+
+    let dir = startDir;
+    while (true) {
+        for (const name of ["deno.json", "deno.jsonc"]) {
+            const candidate = join(dir, name);
+            try {
+                if (Deno.statSync(candidate).isFile) {
+                    configCache.set(startDir, candidate);
+                    return candidate;
+                }
+            } catch {
+                continue;
+            }
+        }
+        const parent = dirname(dir);
+        if (parent === dir) break;
+        dir = parent;
+    }
+
+    configCache.set(startDir, undefined);
+    return undefined;
+}
+
+function virtualIdToSourcePath(virtualId: string): string {
+    return virtualId
+        .slice("\0comptime:".length)
+        .replace(/\?comptime=\d+$/, "");
 }
 
 function messageFrom(err: unknown): string {
