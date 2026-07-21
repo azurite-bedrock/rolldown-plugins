@@ -1,6 +1,8 @@
 import {
     assertEquals,
     assertInstanceOf,
+    assertMatch,
+    assertNotEquals,
     assertRejects,
     assertStringIncludes,
     assertThrows,
@@ -18,6 +20,7 @@ import {
     collectTopLevelDeclarations,
     ComptimeTransformError,
     findComptimeCalls,
+    isLocalFile,
     normalizeToForwardSlashes,
     resolveSpecifier,
     shouldScan,
@@ -745,4 +748,1754 @@ export const value = comptime(() => triple(14));
         await build?.close();
         await teardown();
     }
+});
+
+// shouldScan extended
+
+Deno.test('shouldScan accepts every supported extension', () => {
+    for (const ext of ['js', 'jsx', 'mjs', 'cjs', 'ts', 'tsx', 'mts', 'cts']) {
+        assertEquals(shouldScan('comptime', `/foo/bar.${ext}`, {}), true);
+    }
+});
+
+Deno.test('shouldScan rejects unsupported and extension-less ids', () => {
+    assertEquals(shouldScan('comptime', '/foo/bar.json', {}), false);
+    assertEquals(shouldScan('comptime', '/foo/bar.vue', {}), false);
+    assertEquals(shouldScan('comptime', '/foo/barts', {}), false);
+});
+
+Deno.test('shouldScan extension matching is case sensitive', () => {
+    assertEquals(shouldScan('comptime', '/foo/bar.TS', {}), false);
+});
+
+Deno.test('shouldScan accepts a plain string include/exclude', () => {
+    assertEquals(shouldScan('comptime', '/foo/bar.ts', { include: '**/*.ts' }), true);
+    assertEquals(shouldScan('comptime', '/foo/bar.ts', { exclude: '**/foo/**' }), false);
+});
+
+Deno.test('shouldScan applies exclude before include', () => {
+    assertEquals(
+        shouldScan('comptime', '/foo/bar.ts', {
+            include: ['**/*.ts'],
+            exclude: ['**/bar.ts'],
+        }),
+        false,
+    );
+});
+
+Deno.test('shouldScan matches the substring anywhere in the code', () => {
+    assertEquals(shouldScan('// mentions comptime in a comment', '/f.ts', {}), true);
+    assertEquals(shouldScan('const comptimeish = 1;', '/f.ts', {}), true);
+});
+
+// collectComptimeBindings extended
+
+Deno.test('collectComptimeBindings ignores default and namespace comptime imports', () => {
+    for (const code of [
+        `import comptime from "comptime";`,
+        `import * as comptime from "comptime";`,
+    ]) {
+        const { program } = parseSync('/f.ts', code, {
+            lang: 'ts',
+            sourceType: 'module',
+        });
+        const { comptimeNames, watchNames } = collectComptimeBindings(program);
+        assertEquals(comptimeNames, new Set());
+        assertEquals(watchNames, new Set());
+    }
+});
+
+Deno.test('collectComptimeBindings merges multiple comptime import declarations', () => {
+    const code = `import { comptime } from "comptime";\nimport { comptime as ct, watch } from "comptime";`;
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const { comptimeNames, watchNames } = collectComptimeBindings(program);
+    assertEquals(comptimeNames, new Set(['comptime', 'ct']));
+    assertEquals(watchNames, new Set(['watch']));
+});
+
+Deno.test('collectComptimeBindings ignores comptime-named imports from other modules', () => {
+    const code = `import { comptime } from "./not-comptime.ts";`;
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const { comptimeNames } = collectComptimeBindings(program);
+    assertEquals(comptimeNames, new Set());
+});
+
+Deno.test('collectComptimeBindings supports string-literal import names', () => {
+    const code = `import { "comptime" as ct } from "comptime";`;
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const { comptimeNames } = collectComptimeBindings(program);
+    assertEquals(comptimeNames, new Set(['ct']));
+});
+
+// findComptimeCalls extended
+
+Deno.test('findComptimeCalls accepts function expressions as the argument', () => {
+    const code = `import { comptime } from "comptime";\nexport const x = comptime(function () { return 1; });`;
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const { comptimeNames } = collectComptimeBindings(program);
+    assertEquals(findComptimeCalls(program, comptimeNames).length, 1);
+});
+
+Deno.test('findComptimeCalls ignores calls whose argument is not a function', () => {
+    const code = `import { comptime } from "comptime";\nexport const x = comptime(42);`;
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const { comptimeNames } = collectComptimeBindings(program);
+    assertEquals(findComptimeCalls(program, comptimeNames).length, 0);
+});
+
+Deno.test('findComptimeCalls ignores calls with more than one argument', () => {
+    const code = `import { comptime } from "comptime";\nexport const x = comptime(() => 1, 2);`;
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const { comptimeNames } = collectComptimeBindings(program);
+    assertEquals(findComptimeCalls(program, comptimeNames).length, 0);
+});
+
+Deno.test('findComptimeCalls only records the outer call for nested comptime', () => {
+    const code = `import { comptime } from "comptime";\nexport const x = comptime(() => comptime(() => 1));`;
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const { comptimeNames } = collectComptimeBindings(program);
+    const calls = findComptimeCalls(program, comptimeNames);
+    assertEquals(calls.length, 1);
+    assertEquals(code.slice(calls[0].start, calls[0].end).includes('comptime(() => 1)'), true);
+});
+
+Deno.test('findComptimeCalls finds calls nested in functions and object literals', () => {
+    const code = `
+import { comptime } from "comptime";
+function f() { return comptime(() => 1); }
+const obj = { m: comptime(() => 2) };
+  `.trim();
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const { comptimeNames } = collectComptimeBindings(program);
+    assertEquals(findComptimeCalls(program, comptimeNames).length, 2);
+});
+
+Deno.test('findComptimeCalls treats function parameters as shadowing', () => {
+    const code = `
+import { comptime } from "comptime";
+function f(comptime: unknown) { return (comptime as any)(() => 1); }
+export const y = comptime(() => 2);
+  `.trim();
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const { comptimeNames } = collectComptimeBindings(program);
+    const calls = findComptimeCalls(program, comptimeNames);
+    assertEquals(calls.length, 1);
+    assertEquals(code.slice(calls[0].start, calls[0].end).includes('=> 2'), true);
+});
+
+Deno.test('findComptimeCalls records start/end spanning the whole call', () => {
+    const code = `import { comptime } from "comptime";\nexport const x = comptime(() => 42);`;
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const { comptimeNames } = collectComptimeBindings(program);
+    const calls = findComptimeCalls(program, comptimeNames);
+    assertEquals(code.slice(calls[0].start, calls[0].end), 'comptime(() => 42)');
+});
+
+Deno.test('findComptimeCalls returns empty when comptimeNames is empty', () => {
+    const code = `export const x = comptime(() => 42);`;
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    assertEquals(findComptimeCalls(program, new Set()).length, 0);
+});
+
+// resolveSpecifier / isLocalFile / normalizeToForwardSlashes
+
+Deno.test('resolveSpecifier passes bare specifiers through unchanged', () => {
+    for (const spec of [
+        'npm:some-lib',
+        'npm:some-lib@1.2.3',
+        'jsr:@std/path',
+        'node:fs',
+        'lodash',
+        '@scope/pkg',
+        '#internal',
+        'https://example.com/mod.ts',
+    ]) {
+        assertEquals(resolveSpecifier(spec, '/src'), spec);
+    }
+});
+
+Deno.test('resolveSpecifier resolves relative specifiers against the file dir', () => {
+    assertEquals(resolveSpecifier('./math.ts', '/src/app'), '/src/app/math.ts');
+    assertEquals(resolveSpecifier('../math.ts', '/src/app'), '/src/math.ts');
+    assertEquals(resolveSpecifier('./a/../b.ts', '/src'), '/src/b.ts');
+});
+
+Deno.test('resolveSpecifier keeps absolute posix paths absolute', () => {
+    assertEquals(resolveSpecifier('/abs/math.ts', '/src'), '/abs/math.ts');
+});
+
+Deno.test('normalizeToForwardSlashes converts backslashes', () => {
+    assertEquals(normalizeToForwardSlashes('C:\\a\\b\\c.ts'), 'C:/a/b/c.ts');
+    assertEquals(normalizeToForwardSlashes('/already/posix.ts'), '/already/posix.ts');
+});
+
+Deno.test('isLocalFile distinguishes local paths from bare specifiers', () => {
+    assertEquals(isLocalFile('/src/a.ts'), true);
+    assertEquals(isLocalFile('C:/src/a.ts'), true);
+    assertEquals(isLocalFile('C:\\src\\a.ts'), true);
+    assertEquals(isLocalFile('npm:foo'), false);
+    assertEquals(isLocalFile('jsr:@std/path'), false);
+    assertEquals(isLocalFile('node:fs'), false);
+    assertEquals(isLocalFile('./rel.ts'), false);
+});
+
+// collectImportBindings extended
+
+Deno.test('collectImportBindings skips `import type` declarations', () => {
+    const code = `import type { A } from "./a.ts";`;
+    const { program } = parseSync('/src/f.ts', code, {
+        lang: 'ts',
+        sourceType: 'module',
+    });
+    assertEquals(collectImportBindings(program, '/src', new Set()).size, 0);
+});
+
+Deno.test('collectImportBindings skips inline `type` specifiers but keeps values', () => {
+    const code = `import { type A, B } from "./a.ts";`;
+    const { program } = parseSync('/src/f.ts', code, {
+        lang: 'ts',
+        sourceType: 'module',
+    });
+    const bindings = collectImportBindings(program, '/src', new Set());
+    assertEquals([...bindings.keys()], ['B']);
+});
+
+Deno.test('collectImportBindings ignores side-effect-only imports', () => {
+    const code = `import "./side-effect.ts";`;
+    const { program } = parseSync('/src/f.ts', code, {
+        lang: 'ts',
+        sourceType: 'module',
+    });
+    assertEquals(collectImportBindings(program, '/src', new Set()).size, 0);
+});
+
+Deno.test('collectImportBindings ignores re-exports', () => {
+    const code = `export { a } from "./a.ts";\nexport * from "./b.ts";\nexport * as ns from "./c.ts";`;
+    const { program } = parseSync('/src/f.ts', code, {
+        lang: 'ts',
+        sourceType: 'module',
+    });
+    assertEquals(collectImportBindings(program, '/src', new Set()).size, 0);
+});
+
+Deno.test('collectImportBindings handles mixed default and named imports', () => {
+    const code = `import D, { n } from "./a.ts";`;
+    const { program } = parseSync('/src/f.ts', code, {
+        lang: 'ts',
+        sourceType: 'module',
+    });
+    const bindings = collectImportBindings(program, '/src', new Set());
+    assertEquals(bindings.get('D')!.importedName, 'default');
+    assertEquals(bindings.get('n')!.importedName, 'n');
+    assertEquals(bindings.get('D')!.absSpecifier, '/src/a.ts');
+    assertEquals(bindings.get('n')!.absSpecifier, '/src/a.ts');
+});
+
+Deno.test('collectImportBindings handles mixed default and namespace imports', () => {
+    const code = `import D, * as ns from "./a.ts";`;
+    const { program } = parseSync('/src/f.ts', code, {
+        lang: 'ts',
+        sourceType: 'module',
+    });
+    const bindings = collectImportBindings(program, '/src', new Set());
+    assertEquals(bindings.get('D')!.importedName, 'default');
+    assertEquals(bindings.get('ns')!.importedName, '*');
+});
+
+Deno.test('collectImportBindings records aliases with imported and local names', () => {
+    const code = `import { original as renamed } from "./a.ts";`;
+    const { program } = parseSync('/src/f.ts', code, {
+        lang: 'ts',
+        sourceType: 'module',
+    });
+    const b = collectImportBindings(program, '/src', new Set()).get('renamed')!;
+    assertEquals(b.localName, 'renamed');
+    assertEquals(b.importedName, 'original');
+    assertEquals(b.originalSpecifier, './a.ts');
+});
+
+Deno.test('collectImportBindings supports string-literal imported names', () => {
+    const code = `import { "orig-name" as loc } from "./a.ts";`;
+    const { program } = parseSync('/src/f.ts', code, {
+        lang: 'ts',
+        sourceType: 'module',
+    });
+    const b = collectImportBindings(program, '/src', new Set()).get('loc')!;
+    assertEquals(b.importedName, 'orig-name');
+});
+
+Deno.test('collectImportBindings keeps the same local name across modules distinct', () => {
+    const code = `import { a } from "./a.ts";\nimport { a as b } from "./b.ts";`;
+    const { program } = parseSync('/src/f.ts', code, {
+        lang: 'ts',
+        sourceType: 'module',
+    });
+    const bindings = collectImportBindings(program, '/src', new Set());
+    assertEquals(bindings.get('a')!.absSpecifier, '/src/a.ts');
+    assertEquals(bindings.get('b')!.absSpecifier, '/src/b.ts');
+    assertEquals(bindings.get('b')!.importedName, 'a');
+});
+
+Deno.test('collectImportBindings later declaration wins for a duplicated local name', () => {
+    const code = `import { x } from "./a.ts";\nimport { x } from "./b.ts";`;
+    const { program } = parseSync('/src/f.ts', code, {
+        lang: 'ts',
+        sourceType: 'module',
+    });
+    const bindings = collectImportBindings(program, '/src', new Set());
+    assertEquals(bindings.size, 1);
+    assertEquals(bindings.get('x')!.absSpecifier, '/src/b.ts');
+});
+
+Deno.test('collectImportBindings resolves parent-relative specifiers', () => {
+    const code = `import { up } from "../shared/up.ts";`;
+    const { program } = parseSync('/src/app/f.ts', code, {
+        lang: 'ts',
+        sourceType: 'module',
+    });
+    assertEquals(
+        collectImportBindings(program, '/src/app', new Set()).get('up')!.absSpecifier,
+        '/src/shared/up.ts',
+    );
+});
+
+Deno.test('collectImportBindings passes jsr:, node: and bare specifiers through', () => {
+    const code = `
+import { join } from "jsr:@std/path";
+import { readFile } from "node:fs/promises";
+import { basename } from "@std/path";
+import lodash from "lodash";
+  `.trim();
+    const { program } = parseSync('/src/f.ts', code, {
+        lang: 'ts',
+        sourceType: 'module',
+    });
+    const bindings = collectImportBindings(program, '/src', new Set());
+    assertEquals(bindings.get('join')!.absSpecifier, 'jsr:@std/path');
+    assertEquals(bindings.get('readFile')!.absSpecifier, 'node:fs/promises');
+    assertEquals(bindings.get('basename')!.absSpecifier, '@std/path');
+    assertEquals(bindings.get('lodash')!.absSpecifier, 'lodash');
+});
+
+Deno.test('collectImportBindings drops any local name listed in watchNames', () => {
+    const code = `import { comptime, watch } from "comptime";\nimport { watch as w } from "./x.ts";`;
+    const { program } = parseSync('/src/f.ts', code, {
+        lang: 'ts',
+        sourceType: 'module',
+    });
+    const { watchNames } = collectComptimeBindings(program);
+    const bindings = collectImportBindings(program, '/src', watchNames);
+    assertEquals(bindings.has('w'), true);
+    assertEquals(bindings.has('watch'), false);
+});
+
+Deno.test(
+    'collectImportBindings drops a same-named import from another module (watch shadowing quirk)',
+    () => {
+        const code = `import { comptime, watch } from "comptime";\nimport { watch } from "./chokidar-ish.ts";`;
+        const { program } = parseSync('/src/f.ts', code, {
+            lang: 'ts',
+            sourceType: 'module',
+        });
+        const { watchNames } = collectComptimeBindings(program);
+        const bindings = collectImportBindings(program, '/src', watchNames);
+        assertEquals(bindings.has('watch'), false);
+    },
+);
+
+// collectTopLevelDeclarations extended
+
+Deno.test('collectTopLevelDeclarations records multiple declarators in one statement', () => {
+    const code = `var b = 2, c = 3;`;
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const decls = collectTopLevelDeclarations(program, code);
+    assertEquals(decls.length, 1);
+    assertEquals(decls[0].names, ['b', 'c']);
+});
+
+Deno.test('collectTopLevelDeclarations extracts array pattern and rest names', () => {
+    const code = `const [first, ...rest] = [1, 2, 3];`;
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const names = collectTopLevelDeclarations(program, code).flatMap((d) => d.names);
+    assertEquals(names, ['first', 'rest']);
+});
+
+Deno.test('collectTopLevelDeclarations extracts default-assignment pattern names', () => {
+    const code = `const { a = 1, ...others } = {};`;
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const names = collectTopLevelDeclarations(program, code).flatMap((d) => d.names);
+    assertEquals(names.includes('a'), true);
+    assertEquals(names.includes('others'), true);
+});
+
+Deno.test('collectTopLevelDeclarations captures the exact declaration source', () => {
+    const code = `const PI = 3.14;\nfunction double(x: number) { return x * 2; }`;
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const decls = collectTopLevelDeclarations(program, code);
+    assertEquals(decls[0].source, 'const PI = 3.14;');
+    assertEquals(decls[1].source, 'function double(x: number) { return x * 2; }');
+});
+
+Deno.test('collectTopLevelDeclarations skips type-level and export-default declarations', () => {
+    const code = `interface I { a: number }\ntype T = number;\nexport default function d() {}\nconst ok = 1;`;
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const names = collectTopLevelDeclarations(program, code).flatMap((d) => d.names);
+    assertEquals(names, ['ok']);
+});
+
+Deno.test('collectTopLevelDeclarations ignores non-declaration statements', () => {
+    const code = `import { a } from "./a.ts";\nconsole.log(a);\nexport { a };`;
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    assertEquals(collectTopLevelDeclarations(program, code).length, 0);
+});
+
+// collectIdentifierReferences extended
+
+Deno.test('collectIdentifierReferences collects member-expression property names too', () => {
+    const code = `import { comptime } from "comptime";\nexport const x = comptime(() => ns.deep.prop);`;
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const { comptimeNames } = collectComptimeBindings(program);
+    const calls = findComptimeCalls(program, comptimeNames);
+    const refs = collectIdentifierReferences(calls[0].fn.body);
+    assertEquals(refs.has('ns'), true);
+    assertEquals(refs.has('deep'), true);
+});
+
+Deno.test('collectIdentifierReferences returns an empty set for a literal body', () => {
+    const code = `import { comptime } from "comptime";\nexport const x = comptime(() => 42);`;
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const { comptimeNames } = collectComptimeBindings(program);
+    const calls = findComptimeCalls(program, comptimeNames);
+    assertEquals(collectIdentifierReferences(calls[0].fn.body), new Set());
+});
+
+Deno.test('collectIdentifierReferences finds identifiers used in nested scopes', () => {
+    const code = `
+import { comptime } from "comptime";
+export const x = comptime(() => {
+  const list = [1, 2].map((n) => helper(n));
+  return list;
+});
+  `.trim();
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const { comptimeNames } = collectComptimeBindings(program);
+    const refs = collectIdentifierReferences(findComptimeCalls(program, comptimeNames)[0].fn.body);
+    assertEquals(refs.has('helper'), true);
+    assertEquals(refs.has('list'), true);
+});
+
+// collectDenoEnvReads extended
+
+Deno.test('collectDenoEnvReads finds several distinct keys', () => {
+    const code = `import { comptime } from "comptime";\nexport const x = comptime(() => Deno.env.get("A") + Deno.env.get("B") + Deno.env.get("A"));`;
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const { comptimeNames } = collectComptimeBindings(program);
+    const keys = collectDenoEnvReads(findComptimeCalls(program, comptimeNames)[0].fn.body);
+    assertEquals(keys, new Set(['A', 'B']));
+});
+
+Deno.test('collectDenoEnvReads ignores dynamic keys and non-Deno env reads', () => {
+    const code = `
+import { comptime } from "comptime";
+const k = "K";
+export const x = comptime(() => Deno.env.get(k) + process.env.get("Q") + Deno.env.toObject());
+  `.trim();
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const { comptimeNames } = collectComptimeBindings(program);
+    const keys = collectDenoEnvReads(findComptimeCalls(program, comptimeNames)[0].fn.body);
+    assertEquals(keys, new Set());
+});
+
+// createVirtualModule extended
+
+Deno.test('createVirtualModule emits an unaliased named import when names match', () => {
+    const binding: ImportBinding = {
+        localName: 'fib',
+        importedName: 'fib',
+        absSpecifier: '/abs/math.ts',
+        originalSpecifier: './math.ts',
+    };
+    const src = createVirtualModule([binding], [], `return fib(10);`);
+    assertStringIncludes(src, `import { fib } from "/abs/math.ts";`);
+    assertEquals(src.includes('fib as fib'), false);
+});
+
+Deno.test('createVirtualModule emits imports in the order given', () => {
+    const mk = (n: string, spec: string): ImportBinding => ({
+        localName: n,
+        importedName: n,
+        absSpecifier: spec,
+        originalSpecifier: spec,
+    });
+    const src = createVirtualModule(
+        [mk('a', '/a.ts'), mk('b', 'npm:pkg'), mk('c', 'jsr:@std/path')],
+        [],
+        `return a + b + c;`,
+    );
+    const lines = src.split('\n');
+    assertEquals(lines[0], `import { a } from "/a.ts";`);
+    assertEquals(lines[1], `import { b } from "npm:pkg";`);
+    assertEquals(lines[2], `import { c } from "jsr:@std/path";`);
+});
+
+Deno.test('createVirtualModule puts imports before declarations before the body', () => {
+    const binding: ImportBinding = {
+        localName: 'a',
+        importedName: 'a',
+        absSpecifier: '/a.ts',
+        originalSpecifier: './a.ts',
+    };
+    const src = createVirtualModule(
+        [binding],
+        [{ names: ['helper'], source: 'const helper = () => a;', start: 0, end: 0 }],
+        `return helper();`,
+    );
+    assertEquals(
+        src.indexOf('import { a }') < src.indexOf('const helper'),
+        true,
+    );
+    assertEquals(
+        src.indexOf('const helper') < src.indexOf('__comptime_result'),
+        true,
+    );
+});
+
+Deno.test('createVirtualModule wraps the body in an async IIFE that is awaited', () => {
+    const src = createVirtualModule([], [], `return 1;`);
+    assertStringIncludes(src, 'await (async () => { return 1; })()');
+});
+
+Deno.test('createVirtualModule with no imports or declarations emits only the scaffold', () => {
+    const src = createVirtualModule([], [], `return 1;`);
+    assertEquals(src.split('\n').length, 4);
+});
+
+// contentHash extended
+
+Deno.test('contentHash returns a 64-character lowercase hex digest', async () => {
+    const h = await contentHash('source', []);
+    assertEquals(h.length, 64);
+    assertMatch(h, /^[0-9a-f]{64}$/);
+});
+
+Deno.test('contentHash differs when the source differs', async () => {
+    assertNotEquals(await contentHash('a', []), await contentHash('b', []));
+});
+
+Deno.test('contentHash differs when an env key is added', async () => {
+    assertNotEquals(await contentHash('s', []), await contentHash('s', [['K', '']]));
+});
+
+Deno.test('contentHash distinguishes source/env boundary shifts', async () => {
+    const a = await contentHash('ab', []);
+    const b = await contentHash('a', [['b', '']]);
+    assertNotEquals(a, b);
+});
+
+// serializeValue exotic values
+
+Deno.test('serializeValue serializes undefined and null', () => {
+    assertEquals(serializeValue(undefined, undefined), 'void 0');
+    assertEquals(serializeValue(null, undefined), 'null');
+});
+
+Deno.test('serializeValue serializes booleans and special numbers', () => {
+    assertEquals(serializeValue(true, undefined), 'true');
+    assertEquals(serializeValue(NaN, undefined), 'NaN');
+    assertEquals(serializeValue(Infinity, undefined), 'Infinity');
+    assertEquals(serializeValue(-Infinity, undefined), '-Infinity');
+    assertEquals(serializeValue(-0, undefined), '-0');
+});
+
+Deno.test('serializeValue serializes BigInt', () => {
+    assertEquals(serializeValue(10n, undefined), '10n');
+});
+
+Deno.test('serializeValue serializes Date, RegExp, Map and Set', () => {
+    assertEquals(serializeValue(new Date(0), undefined), 'new Date(0)');
+    assertEquals(serializeValue(/ab+c/gi, undefined), 'new RegExp("ab+c","gi")');
+    assertEquals(serializeValue(new Map([['a', 1]]), undefined), 'new Map([["a",1]])');
+    assertEquals(serializeValue(new Set([1, 2]), undefined), 'new Set([1,2])');
+});
+
+Deno.test('serializeValue serializes typed arrays and URLs', () => {
+    assertEquals(
+        serializeValue(new Uint8Array([1, 2, 3]), undefined),
+        'new Uint8Array([1,2,3])',
+    );
+    assertEquals(
+        serializeValue(new URL('https://example.com/'), undefined),
+        'new URL("https://example.com/")',
+    );
+});
+
+Deno.test('serializeValue escapes strings safely', () => {
+    assertEquals(serializeValue('he said "hi"\n', undefined), '"he said \\"hi\\"\\n"');
+});
+
+Deno.test('serializeValue handles cyclic references', () => {
+    const cyclic: Record<string, unknown> = { a: 1 };
+    cyclic.self = cyclic;
+    const out = serializeValue(cyclic, undefined);
+    assertStringIncludes(out, 'a.self=a');
+});
+
+Deno.test('serializeValue preserves repeated references as one object', () => {
+    const shared = { s: 1 };
+    const out = serializeValue({ x: shared, y: shared }, undefined);
+    assertStringIncludes(out, '{x:a,y:a}');
+});
+
+Deno.test('serializeValue throws for symbols, class instances and Errors', () => {
+    class Foo {
+        x = 1;
+    }
+    for (const v of [Symbol('s'), new Foo(), new Error('boom')]) {
+        assertThrows(
+            () => serializeValue(v, undefined),
+            Error,
+            'comptime returned a value that cannot be serialized',
+        );
+    }
+});
+
+Deno.test('serializeValue tries serializers in order and falls through', () => {
+    const order: string[] = [];
+    const serializers = [
+        {
+            test: (v: unknown) => {
+                order.push('first');
+                return typeof v === 'string';
+            },
+            serialize: () => 'FIRST',
+        },
+        {
+            test: (v: unknown) => {
+                order.push('second');
+                return typeof v === 'number';
+            },
+            serialize: () => 'SECOND',
+        },
+    ];
+    assertEquals(serializeValue(1, serializers), 'SECOND');
+    assertEquals(order, ['first', 'second']);
+    assertEquals(serializeValue([1], serializers), '[1]');
+});
+
+Deno.test('serializeValue custom serializer can rescue an unserializable value', () => {
+    const serializers = [
+        { test: (v: unknown) => typeof v === 'function', serialize: () => '(() => 1)' },
+    ];
+    assertEquals(serializeValue(() => 2, serializers), '(() => 1)');
+});
+
+// createCore: import hoisting into the virtual module
+
+function recordingEvaluator(value: unknown = 1, watchFiles: string[] = []) {
+    const sources: string[] = [];
+    return {
+        sources,
+        evaluate: (_id: string, src: string): Promise<EvaluateResult> => {
+            sources.push(src);
+            return Promise.resolve({ value, watchFiles });
+        },
+    };
+}
+
+async function virtualSourceFor(code: string, id = '/src/f.ts'): Promise<string> {
+    const rec = recordingEvaluator();
+    const core = createCore(rec as any, {});
+    await core.transform(code, id, {});
+    return rec.sources[0];
+}
+
+Deno.test('createCore hoists only the imports referenced inside the callback', async () => {
+    const src = await virtualSourceFor(
+        `
+import { comptime } from "comptime";
+import { used } from "./used.ts";
+import { unused } from "./unused.ts";
+export const x = comptime(() => used());
+    `.trim(),
+    );
+    assertStringIncludes(src, `import { used } from "/src/used.ts";`);
+    assertEquals(src.includes('unused'), false);
+});
+
+Deno.test('createCore does not hoist imports used only outside the callback', async () => {
+    const src = await virtualSourceFor(
+        `
+import { comptime } from "comptime";
+import { outside } from "./outside.ts";
+export const x = comptime(() => 1);
+export const y = outside;
+    `.trim(),
+    );
+    assertEquals(src.includes('outside'), false);
+});
+
+Deno.test('createCore hoists aliased imports with the alias intact', async () => {
+    const src = await virtualSourceFor(
+        `
+import { comptime } from "comptime";
+import { original as renamed } from "./a.ts";
+export const x = comptime(() => renamed());
+    `.trim(),
+    );
+    assertStringIncludes(src, `import { original as renamed } from "/src/a.ts";`);
+});
+
+Deno.test('createCore hoists default imports', async () => {
+    const src = await virtualSourceFor(
+        `
+import { comptime } from "comptime";
+import Foo from "./foo.ts";
+export const x = comptime(() => Foo());
+    `.trim(),
+    );
+    assertStringIncludes(src, `import Foo from "/src/foo.ts";`);
+});
+
+Deno.test('createCore hoists namespace imports', async () => {
+    const src = await virtualSourceFor(
+        `
+import { comptime } from "comptime";
+import * as ns from "./ns.ts";
+export const x = comptime(() => ns.value);
+    `.trim(),
+    );
+    assertStringIncludes(src, `import * as ns from "/src/ns.ts";`);
+});
+
+Deno.test('createCore hoists default and named imports from the same module', async () => {
+    const src = await virtualSourceFor(
+        `
+import { comptime } from "comptime";
+import Def, { named } from "./both.ts";
+export const x = comptime(() => Def() + named);
+    `.trim(),
+    );
+    assertStringIncludes(src, `import Def from "/src/both.ts";`);
+    assertStringIncludes(src, `import { named } from "/src/both.ts";`);
+});
+
+Deno.test('createCore leaves npm:, jsr: and node: specifiers untouched when hoisting', async () => {
+    const src = await virtualSourceFor(
+        `
+import { comptime } from "comptime";
+import { a } from "npm:pkg-a";
+import { b } from "jsr:@scope/b";
+import { c } from "node:path";
+import { d } from "bare-pkg";
+export const x = comptime(() => [a, b, c, d]);
+    `.trim(),
+    );
+    assertStringIncludes(src, `import { a } from "npm:pkg-a";`);
+    assertStringIncludes(src, `import { b } from "jsr:@scope/b";`);
+    assertStringIncludes(src, `import { c } from "node:path";`);
+    assertStringIncludes(src, `import { d } from "bare-pkg";`);
+});
+
+Deno.test('createCore resolves relative import specifiers against the module dir', async () => {
+    const src = await virtualSourceFor(
+        `
+import { comptime } from "comptime";
+import { up } from "../shared/up.ts";
+export const x = comptime(() => up);
+    `.trim(),
+        '/src/app/f.ts',
+    );
+    assertStringIncludes(src, `import { up } from "/src/shared/up.ts";`);
+});
+
+Deno.test('createCore does not hoist type-only imports', async () => {
+    const src = await virtualSourceFor(
+        `
+import { comptime } from "comptime";
+import type { T } from "./types.ts";
+export const x = comptime(() => { const v: T = 1 as any; return v; });
+    `.trim(),
+    );
+    assertEquals(src.includes('./types.ts'), false);
+    assertEquals(src.includes('/src/types.ts'), false);
+});
+
+Deno.test('createCore does not hoist re-exported bindings', async () => {
+    const src = await virtualSourceFor(
+        `
+import { comptime } from "comptime";
+export { thing } from "./thing.ts";
+export const x = comptime(() => 1);
+    `.trim(),
+    );
+    assertEquals(src.includes('thing'), false);
+});
+
+Deno.test('createCore does not hoist side-effect-only imports', async () => {
+    const src = await virtualSourceFor(
+        `
+import { comptime } from "comptime";
+import "./side-effect.ts";
+export const x = comptime(() => 1);
+    `.trim(),
+    );
+    assertEquals(src.includes('side-effect'), false);
+});
+
+Deno.test('createCore still hoists an import shadowed by a local declaration in the body', async () => {
+    const src = await virtualSourceFor(
+        `
+import { comptime } from "comptime";
+import { a } from "./a.ts";
+export const x = comptime(() => { const a = 5; return a; });
+    `.trim(),
+    );
+    assertStringIncludes(src, `import { a } from "/src/a.ts";`);
+    assertStringIncludes(src, 'const a = 5;');
+});
+
+Deno.test('createCore hoists different import sets for different calls in one file', async () => {
+    const rec = recordingEvaluator();
+    const core = createCore(rec as any, {});
+    await core.transform(
+        `
+import { comptime } from "comptime";
+import { a } from "./a.ts";
+import { b } from "./b.ts";
+export const x = comptime(() => a);
+export const y = comptime(() => b);
+        `.trim(),
+        '/src/f.ts',
+        {},
+    );
+    assertEquals(rec.sources.length, 2);
+    assertStringIncludes(rec.sources[0], '/src/a.ts');
+    assertEquals(rec.sources[0].includes('/src/b.ts'), false);
+    assertStringIncludes(rec.sources[1], '/src/b.ts');
+    assertEquals(rec.sources[1].includes('/src/a.ts'), false);
+});
+
+Deno.test('createCore inlines top-level declarations referenced by the callback', async () => {
+    const src = await virtualSourceFor(
+        `
+import { comptime } from "comptime";
+const PI = 3.14;
+const UNUSED = 0;
+export const x = comptime(() => PI * 2);
+    `.trim(),
+    );
+    assertStringIncludes(src, 'const PI = 3.14;');
+    assertEquals(src.includes('UNUSED'), false);
+});
+
+Deno.test('createCore does not inline the declaration that contains the call itself', async () => {
+    const src = await virtualSourceFor(
+        `
+import { comptime } from "comptime";
+export const x = comptime(() => x);
+    `.trim(),
+    );
+    assertEquals(src.includes('export const x'), false);
+});
+
+// createCore: dynamic import rewriting
+
+Deno.test('createCore rewrites relative dynamic imports inside the callback', async () => {
+    const src = await virtualSourceFor(
+        `
+import { comptime } from "comptime";
+export const x = comptime(async () => (await import("./mod.ts")).v);
+    `.trim(),
+    );
+    assertStringIncludes(src, `import("/src/mod.ts")`);
+});
+
+Deno.test('createCore rewrites parent-relative dynamic imports', async () => {
+    const src = await virtualSourceFor(
+        `
+import { comptime } from "comptime";
+export const x = comptime(async () => { const m = await import('../up/mod.ts'); return m.v; });
+    `.trim(),
+        '/src/nested/f.ts',
+    );
+    assertStringIncludes(src, `import("/src/up/mod.ts")`);
+});
+
+Deno.test('createCore leaves bare dynamic import specifiers alone', async () => {
+    const src = await virtualSourceFor(
+        `
+import { comptime } from "comptime";
+export const x = comptime(async () => (await import("npm:foo")).v);
+    `.trim(),
+    );
+    assertStringIncludes(src, `import("npm:foo")`);
+});
+
+Deno.test('createCore leaves absolute dynamic import specifiers alone', async () => {
+    const src = await virtualSourceFor(
+        `
+import { comptime } from "comptime";
+export const x = comptime(async () => (await import("/abs/mod.ts")).v);
+    `.trim(),
+    );
+    assertStringIncludes(src, `import("/abs/mod.ts")`);
+});
+
+Deno.test('createCore rewrites several dynamic imports in one callback', async () => {
+    const src = await virtualSourceFor(
+        `
+import { comptime } from "comptime";
+export const x = comptime(async () => {
+  const a = await import("./a.ts");
+  const b = await import("./b.ts");
+  return [a, b];
+});
+    `.trim(),
+    );
+    assertStringIncludes(src, `import("/src/a.ts")`);
+    assertStringIncludes(src, `import("/src/b.ts")`);
+});
+
+// createCore: watch file registration
+
+Deno.test('createCore registers watch files for local imports only', async () => {
+    const watched: string[] = [];
+    const core = createCore(recordingEvaluator() as any, {});
+    await core.transform(
+        `
+import { comptime } from "comptime";
+import { a } from "./a.ts";
+import { b } from "npm:pkg";
+export const x = comptime(() => a + b);
+        `.trim(),
+        '/src/f.ts',
+        { addWatchFile: (id) => void watched.push(id) },
+    );
+    assertEquals(watched, ['/src/a.ts']);
+});
+
+Deno.test('createCore does not register watch files for unused imports', async () => {
+    const watched: string[] = [];
+    const core = createCore(recordingEvaluator() as any, {});
+    await core.transform(
+        `
+import { comptime } from "comptime";
+import { unused } from "./unused.ts";
+export const x = comptime(() => 1);
+        `.trim(),
+        '/src/f.ts',
+        { addWatchFile: (id) => void watched.push(id) },
+    );
+    assertEquals(watched, []);
+});
+
+Deno.test('createCore forwards watch files reported by the evaluator', async () => {
+    const watched: string[] = [];
+    const core = createCore(recordingEvaluator(1, ['/data/one.json']) as any, {});
+    await core.transform(
+        `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`,
+        '/src/f.ts',
+        { addWatchFile: (id) => void watched.push(id) },
+    );
+    assertEquals(watched, ['/data/one.json']);
+});
+
+Deno.test('createCore skips watch registration on a cache hit and re-registers after invalidate', async () => {
+    const watched: string[] = [];
+    const core = createCore(recordingEvaluator(1, ['/data/one.json']) as any, {});
+    const code = `
+import { comptime } from "comptime";
+import { a } from "./a.ts";
+export const x = comptime(() => a);
+    `.trim();
+    const ctx = { addWatchFile: (id: string) => void watched.push(id) };
+    await core.transform(code, '/src/f.ts', ctx);
+    assertEquals(watched, ['/src/a.ts', '/data/one.json']);
+    await core.transform(code, '/src/f.ts', ctx);
+    assertEquals(watched.length, 2);
+    core.invalidate();
+    await core.transform(code, '/src/f.ts', ctx);
+    assertEquals(watched.length, 4);
+});
+
+Deno.test('createCore works when the context provides no addWatchFile', async () => {
+    const core = createCore(recordingEvaluator(1, ['/data/one.json']) as any, {});
+    const result = await core.transform(
+        `import { comptime } from "comptime";\nimport { a } from "./a.ts";\nexport const x = comptime(() => a);`,
+        '/src/f.ts',
+        {},
+    );
+    assertEquals(result !== null, true);
+});
+
+// createCore: caching keyed on hoisted content
+
+Deno.test('createCore cache keys differ when a hoisted import path differs', async () => {
+    let count = 0;
+    const counting = {
+        evaluate: (): Promise<EvaluateResult> => {
+            count++;
+            return Promise.resolve({ value: 1, watchFiles: [] });
+        },
+    };
+    const core = createCore(counting as any, {});
+    const code = `import { comptime } from "comptime";\nimport { a } from "./a.ts";\nexport const x = comptime(() => a);`;
+    await core.transform(code, '/one/f.ts', {});
+    await core.transform(code, '/two/f.ts', {});
+    assertEquals(count, 2);
+});
+
+Deno.test('createCore cache is shared across files with identical virtual modules', async () => {
+    let count = 0;
+    const counting = {
+        evaluate: (): Promise<EvaluateResult> => {
+            count++;
+            return Promise.resolve({ value: 1, watchFiles: [] });
+        },
+    };
+    const core = createCore(counting as any, {});
+    const code = `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`;
+    await core.transform(code, '/one/f.ts', {});
+    await core.transform(code, '/two/f.ts', {});
+    assertEquals(count, 1);
+});
+
+Deno.test('createCore cache key includes referenced Deno.env values', async () => {
+    let count = 0;
+    const counting = {
+        evaluate: (): Promise<EvaluateResult> => {
+            count++;
+            return Promise.resolve({ value: 1, watchFiles: [] });
+        },
+    };
+    const core = createCore(counting as any, {});
+    const code = `import { comptime } from "comptime";\nexport const x = comptime(() => Deno.env.get("COMPTIME_TEST_KEY"));`;
+    Deno.env.set('COMPTIME_TEST_KEY', 'one');
+    try {
+        await core.transform(code, '/f.ts', {});
+        await core.transform(code, '/f.ts', {});
+        assertEquals(count, 1);
+        Deno.env.set('COMPTIME_TEST_KEY', 'two');
+        await core.transform(code, '/f.ts', {});
+        assertEquals(count, 2);
+    } finally {
+        Deno.env.delete('COMPTIME_TEST_KEY');
+    }
+});
+
+// createCore: options and results
+
+Deno.test('createCore.transform returns null for excluded ids', async () => {
+    const core = createCore(mockEvaluator as any, { exclude: ['**/skip/**'] });
+    assertEquals(await core.transform(
+        `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`,
+        '/skip/f.ts',
+        {},
+    ), null);
+});
+
+Deno.test('createCore.transform returns null for ids outside include', async () => {
+    const core = createCore(mockEvaluator as any, { include: ['**/src/**'] });
+    assertEquals(await core.transform(
+        `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`,
+        '/other/f.ts',
+        {},
+    ), null);
+});
+
+Deno.test('createCore.transform returns null for virtual (\\0-prefixed) ids', async () => {
+    const core = createCore(mockEvaluator as any, {});
+    assertEquals(await core.transform(
+        `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`,
+        '\0virtual.ts',
+        {},
+    ), null);
+});
+
+Deno.test('createCore.transform returns null when comptime is imported but never called', async () => {
+    const core = createCore(mockEvaluator as any, {});
+    assertEquals(await core.transform(
+        `import { comptime } from "comptime";\nexport const x = 1;`,
+        '/f.ts',
+        {},
+    ), null);
+});
+
+Deno.test('createCore.transform returns null when comptime() comes from another module', async () => {
+    const core = createCore(mockEvaluator as any, {});
+    assertEquals(await core.transform(
+        `import { comptime } from "./local.ts";\nexport const x = comptime(() => 1);`,
+        '/f.ts',
+        {},
+    ), null);
+});
+
+Deno.test('createCore.transform honours an aliased comptime import', async () => {
+    const core = createCore(mockEvaluator as any, {});
+    const result = await core.transform(
+        `import { comptime as ct } from "comptime";\nexport const x = ct(() => 1);`,
+        '/f.ts',
+        {},
+    );
+    assertStringIncludes(result!.code, 'export const x = 55;');
+});
+
+Deno.test('createCore.transform replaces every call in a file', async () => {
+    const values = [1, 'two', { three: 3 }];
+    let i = 0;
+    const seq = {
+        evaluate: (): Promise<EvaluateResult> =>
+            Promise.resolve({ value: values[i++], watchFiles: [] }),
+    };
+    const core = createCore(seq as any, {});
+    const result = await core.transform(
+        `
+import { comptime } from "comptime";
+export const a = comptime(() => 1);
+export const b = comptime(() => 2);
+export const c = comptime(() => 3);
+        `.trim(),
+        '/f.ts',
+        {},
+    );
+    assertEquals(result!.code.includes('comptime(() =>'), false);
+    assertStringIncludes(result!.code, 'export const a = 1;');
+    assertStringIncludes(result!.code, 'export const b = "two";');
+    assertStringIncludes(result!.code, 'export const c = {three:3};');
+});
+
+Deno.test('createCore.transform handles a call nested inside another expression', async () => {
+    const core = createCore(mockEvaluator as any, {});
+    const result = await core.transform(
+        `import { comptime } from "comptime";\nexport const obj = { n: comptime(() => 1) + 1 };`,
+        '/f.ts',
+        {},
+    );
+    assertStringIncludes(result!.code, '{ n: 55 + 1 }');
+});
+
+Deno.test('createCore.transform applies custom serializers', async () => {
+    const core = createCore(
+        { evaluate: () => Promise.resolve({ value: new Date(0), watchFiles: [] }) } as any,
+        {
+            serializers: [
+                { test: (v: unknown) => v instanceof Date, serialize: () => 'DATE_LITERAL' },
+            ],
+        },
+    );
+    const result = await core.transform(
+        `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`,
+        '/f.ts',
+        {},
+    );
+    assertStringIncludes(result!.code, 'export const x = DATE_LITERAL;');
+});
+
+Deno.test('createCore.transform forwards innerPlugins to the evaluator', async () => {
+    const plugin = { name: 'inner' };
+    let seen: unknown;
+    const core = createCore(
+        {
+            evaluate: (_id: string, _src: string, plugins?: unknown[]) => {
+                seen = plugins;
+                return Promise.resolve({ value: 1, watchFiles: [] });
+            },
+        } as any,
+        { innerPlugins: [plugin] },
+    );
+    await core.transform(
+        `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`,
+        '/f.ts',
+        {},
+    );
+    assertEquals(seen, [plugin]);
+});
+
+Deno.test('createCore.transform passes a distinct virtual id per call index', async () => {
+    const ids: string[] = [];
+    const core = createCore(
+        {
+            evaluate: (id: string) => {
+                ids.push(id);
+                return Promise.resolve({ value: 1, watchFiles: [] });
+            },
+        } as any,
+        {},
+    );
+    await core.transform(
+        `import { comptime } from "comptime";\nexport const a = comptime(() => 1);\nexport const b = comptime(() => 2);`,
+        '/src/f.ts',
+        {},
+    );
+    assertEquals(ids, [
+        '\0comptime:/src/f.ts?comptime=0',
+        '\0comptime:/src/f.ts?comptime=1',
+    ]);
+});
+
+Deno.test('createCore.transform produces a source map naming the original file', async () => {
+    const core = createCore(mockEvaluator as any, {});
+    const result = await core.transform(
+        `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`,
+        '/src/f.ts',
+        {},
+    );
+    const map = result!.map as { version: number; sources: string[] };
+    assertEquals(map.version, 3);
+    assertEquals(map.sources, ['/src/f.ts']);
+});
+
+Deno.test('createCore.resolveId and load are inert', () => {
+    const core = createCore(mockEvaluator as any, {});
+    assertEquals(core.resolveId('anything'), null);
+    assertEquals(core.load('anything'), null);
+});
+
+// createCore: error paths
+
+Deno.test('createCore.transform reports loc and frame for evaluation errors', async () => {
+    const core = createCore(
+        { evaluate: () => Promise.reject(new Error('kaboom')) } as any,
+        {},
+    );
+    const err = await assertRejects(
+        () =>
+            core.transform(
+                `import { comptime } from "comptime";\nconst pad = 1;\nexport const x = comptime(() => 1);`,
+                '/src/f.ts',
+                {},
+            ),
+        ComptimeTransformError,
+        'comptime evaluation threw: kaboom',
+    );
+    assertEquals(err.loc, { file: '/src/f.ts', line: 3, column: 18 });
+    assertEquals(err.frame, 'export const x = comptime(() => 1);\n                 ^');
+});
+
+Deno.test('createCore.transform does not double-prefix messages already starting with comptime', async () => {
+    const core = createCore(
+        { evaluate: () => Promise.reject(new Error('comptime inner build failed: nope')) } as any,
+        {},
+    );
+    const err = await assertRejects(
+        () =>
+            core.transform(
+                `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`,
+                '/f.ts',
+                {},
+            ),
+        ComptimeTransformError,
+    );
+    assertEquals(err.message, 'comptime inner build failed: nope');
+});
+
+Deno.test('createCore.transform stringifies non-Error rejections', async () => {
+    const core = createCore({ evaluate: () => Promise.reject('plain string') } as any, {});
+    await assertRejects(
+        () =>
+            core.transform(
+                `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`,
+                '/f.ts',
+                {},
+            ),
+        ComptimeTransformError,
+        'comptime evaluation threw: plain string',
+    );
+});
+
+Deno.test('createCore.transform times out slow evaluations', async () => {
+    const core = createCore({ evaluate: () => new Promise(() => {}) } as any, {
+        timeout: 25,
+    });
+    await assertRejects(
+        () =>
+            core.transform(
+                `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`,
+                '/f.ts',
+                {},
+            ),
+        ComptimeTransformError,
+        'comptime evaluation timed out after 25ms',
+    );
+});
+
+Deno.test('createCore.transform reports loc and frame for serialization errors', async () => {
+    const core = createCore(
+        { evaluate: () => Promise.resolve({ value: () => {}, watchFiles: [] }) } as any,
+        {},
+    );
+    const err = await assertRejects(
+        () =>
+            core.transform(
+                `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`,
+                '/src/f.ts',
+                {},
+            ),
+        ComptimeTransformError,
+        'comptime returned a value that cannot be serialized',
+    );
+    assertEquals(err.loc.line, 2);
+    assertEquals(err.loc.file, '/src/f.ts');
+    assertStringIncludes(err.frame, '^');
+});
+
+Deno.test('createCore.transform rejects function-expression callbacks with parameters', async () => {
+    const core = createCore(mockEvaluator as any, {});
+    await assertRejects(
+        () =>
+            core.transform(
+                `import { comptime } from "comptime";\nexport const x = comptime(function (n: number) { return n; });`,
+                '/f.ts',
+                {},
+            ),
+        ComptimeTransformError,
+        'comptime() requires a single arrow function with no parameters',
+    );
+});
+
+Deno.test('createCore.transform does not cache failed evaluations', async () => {
+    let count = 0;
+    const core = createCore(
+        {
+            evaluate: () => {
+                count++;
+                return Promise.reject(new Error('always fails'));
+            },
+        } as any,
+        {},
+    );
+    const code = `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`;
+    await assertRejects(() => core.transform(code, '/f.ts', {}));
+    await assertRejects(() => core.transform(code, '/f.ts', {}));
+    assertEquals(count, 2);
+});
+
+// plugin surface
+
+Deno.test('comptime plugin exposes the expected hook surface', () => {
+    const p = comptimePlugin() as any;
+    assertEquals(p.name, 'comptime');
+    assertEquals(p.enforce, 'pre');
+    assertEquals(typeof p.resolveId, 'function');
+    assertEquals(typeof p.load, 'function');
+    assertEquals(typeof p.transform, 'function');
+    assertEquals(typeof p.watchChange, 'function');
+});
+
+Deno.test('comptime plugin resolveId and load return null', () => {
+    const p = comptimePlugin() as any;
+    assertEquals(p.resolveId.call({}, '/anything.ts'), null);
+    assertEquals(p.load.call({}, '/anything.ts'), null);
+});
+
+Deno.test('comptime plugin transform returns undefined for non-comptime modules', async () => {
+    const p = comptimePlugin() as any;
+    assertEquals(await p.transform.call({}, 'export const x = 1;', '/f.ts'), undefined);
+});
+
+Deno.test('comptime plugin transform reports watch files through the plugin context', async () => {
+    const dir = join(WATCH_FIXTURE_DIR, 'plugin-ctx');
+    await ensureDir(dir);
+    try {
+        const lib = join(dir, 'lib.ts').replace(/\\/g, '/');
+        await Deno.writeTextFile(lib, `export const N = 3;`);
+        const watched: string[] = [];
+        const p = comptimePlugin() as any;
+        await p.transform.call(
+            { addWatchFile: (id: string) => void watched.push(id) },
+            `import { comptime } from "comptime";\nimport { N } from "./lib.ts";\nexport const x = comptime(() => N);`,
+            join(dir, 'entry.ts'),
+        );
+        assertEquals(watched, [lib]);
+    } finally {
+        await Deno.remove(dir, { recursive: true });
+        await Deno.remove(WATCH_FIXTURE_DIR).catch(() => {});
+    }
+});
+
+Deno.test('comptime plugin watchChange invalidates the cache', async () => {
+    const p = comptimePlugin() as any;
+    const dir = join(WATCH_FIXTURE_DIR, 'invalidate');
+    await ensureDir(dir);
+    try {
+        const dataFile = join(dir, 'v.txt').replace(/\\/g, '/');
+        const entry = join(dir, 'entry.ts');
+        await Deno.writeTextFile(dataFile, 'first');
+        const code = `import { comptime } from "comptime";\nexport const v = comptime(async () => await Deno.readTextFile("${dataFile}"));`;
+        const first = await p.transform.call({}, code, entry);
+        assertStringIncludes(first.code, '"first"');
+
+        await Deno.writeTextFile(dataFile, 'second');
+        const cached = await p.transform.call({}, code, entry);
+        assertStringIncludes(cached.code, '"first"');
+
+        p.watchChange.call({}, dataFile, { event: 'update' });
+        const fresh = await p.transform.call({}, code, entry);
+        assertStringIncludes(fresh.code, '"second"');
+    } finally {
+        await Deno.remove(dir, { recursive: true });
+        await Deno.remove(WATCH_FIXTURE_DIR).catch(() => {});
+    }
+});
+
+// import integration helpers
+
+const IMPORT_FIXTURE_DIR =
+    (Deno.env.get('TEMP') ?? '/tmp').replace(/\\/g, '/') + '/comptime-import-test';
+const WATCH_FIXTURE_DIR =
+    (Deno.env.get('TEMP') ?? '/tmp').replace(/\\/g, '/') + '/comptime-watch-test';
+
+async function buildFixture(
+    name: string,
+    entryName: string,
+    makeFiles: (dir: string) => Record<string, string>,
+): Promise<string> {
+    const dir = join(IMPORT_FIXTURE_DIR, name).replace(/\\/g, '/');
+    await ensureDir(dir);
+    let build: Awaited<ReturnType<typeof rolldown>> | undefined;
+    try {
+        for (const [file, content] of Object.entries(makeFiles(dir))) {
+            const target = join(dir, file);
+            await ensureDir(join(target, '..'));
+            await Deno.writeTextFile(target, content);
+        }
+        build = await rolldown({
+            input: join(dir, entryName),
+            plugins: [aliasComptime(), comptimePlugin()],
+        });
+        const { output } = await build.generate({ format: 'esm' });
+        return output[0].code;
+    } finally {
+        await build?.close();
+        await Deno.remove(dir, { recursive: true }).catch(() => {});
+        // Removes the shared parent once the last fixture subdirectory is gone.
+        await Deno.remove(IMPORT_FIXTURE_DIR).catch(() => {});
+    }
+}
+
+// plugin integration: imports
+
+Deno.test('comptime plugin evaluates through a named import', async () => {
+    const code = await buildFixture('named', 'entry.ts', () => ({
+        'lib.ts': `export function double(x: number) { return x * 2; }`,
+        'entry.ts': `import { comptime } from "comptime";\nimport { double } from "./lib.ts";\nexport const v = comptime(() => double(21));`,
+    }));
+    assertStringIncludes(code, 'v = 42');
+});
+
+Deno.test('comptime plugin evaluates through an aliased import', async () => {
+    const code = await buildFixture('aliased', 'entry.ts', () => ({
+        'lib.ts': `export function original() { return "aliased"; }`,
+        'entry.ts': `import { comptime } from "comptime";\nimport { original as renamed } from "./lib.ts";\nexport const v = comptime(() => renamed());`,
+    }));
+    assertStringIncludes(code, '"aliased"');
+});
+
+Deno.test('comptime plugin evaluates through a default import', async () => {
+    const code = await buildFixture('default', 'entry.ts', () => ({
+        'lib.ts': `export default function () { return "defaulted"; }`,
+        'entry.ts': `import { comptime } from "comptime";\nimport def from "./lib.ts";\nexport const v = comptime(() => def());`,
+    }));
+    assertStringIncludes(code, '"defaulted"');
+});
+
+Deno.test('comptime plugin evaluates through a namespace import', async () => {
+    const code = await buildFixture('namespace', 'entry.ts', () => ({
+        'lib.ts': `export const a = 1;\nexport const b = 2;`,
+        'entry.ts': `import { comptime } from "comptime";\nimport * as ns from "./lib.ts";\nexport const v = comptime(() => ns.a + ns.b);`,
+    }));
+    assertStringIncludes(code, 'v = 3');
+});
+
+Deno.test('comptime plugin evaluates default and named imports from one module', async () => {
+    const code = await buildFixture('default-and-named', 'entry.ts', () => ({
+        'lib.ts': `export default 10;\nexport const extra = 32;`,
+        'entry.ts': `import { comptime } from "comptime";\nimport base, { extra } from "./lib.ts";\nexport const v = comptime(() => base + extra);`,
+    }));
+    assertStringIncludes(code, 'v = 42');
+});
+
+Deno.test('comptime plugin follows transitive imports of an imported module', async () => {
+    const code = await buildFixture('transitive', 'entry.ts', () => ({
+        'deep.ts': `export const DEEP = 7;`,
+        'mid.ts': `import { DEEP } from "./deep.ts";\nexport const mid = DEEP * 3;`,
+        'entry.ts': `import { comptime } from "comptime";\nimport { mid } from "./mid.ts";\nexport const v = comptime(() => mid);`,
+    }));
+    assertStringIncludes(code, 'v = 21');
+});
+
+Deno.test('comptime plugin follows a re-export chain', async () => {
+    const code = await buildFixture('reexport', 'entry.ts', () => ({
+        'base.ts': `export const BASE = "base-value";`,
+        'reex.ts': `export { BASE } from "./base.ts";`,
+        'entry.ts': `import { comptime } from "comptime";\nimport { BASE } from "./reex.ts";\nexport const v = comptime(() => BASE);`,
+    }));
+    assertStringIncludes(code, '"base-value"');
+});
+
+Deno.test('comptime plugin follows a star re-export', async () => {
+    const code = await buildFixture('star-reexport', 'entry.ts', () => ({
+        'base.ts': `export const STAR = "star-value";`,
+        'reex.ts': `export * from "./base.ts";`,
+        'entry.ts': `import { comptime } from "comptime";\nimport { STAR } from "./reex.ts";\nexport const v = comptime(() => STAR);`,
+    }));
+    assertStringIncludes(code, '"star-value"');
+});
+
+Deno.test('comptime plugin resolves imports from a subdirectory with ../ specifiers', async () => {
+    const code = await buildFixture('parent-relative', 'sub/entry.ts', () => ({
+        'shared.ts': `export const SHARED = "shared!";`,
+        'sub/entry.ts': `import { comptime } from "comptime";\nimport { SHARED } from "../shared.ts";\nexport const v = comptime(() => SHARED);`,
+    }));
+    assertStringIncludes(code, '"shared!"');
+});
+
+Deno.test('comptime plugin resolves an absolute import specifier', async () => {
+    const code = await buildFixture('absolute', 'entry.ts', (dir) => ({
+        'abs.ts': `export const ABS = "absolute!";`,
+        'entry.ts': `import { comptime } from "comptime";\nimport { ABS } from "${dir}/abs.ts";\nexport const v = comptime(() => ABS);`,
+    }));
+    assertStringIncludes(code, '"absolute!"');
+});
+
+Deno.test('comptime plugin keeps a side-effect import out of the comptime module', async () => {
+    const code = await buildFixture('side-effect', 'entry.ts', () => ({
+        'sfx.ts': `globalThis.__comptime_sfx = true;\nexport {};`,
+        'entry.ts': `import { comptime } from "comptime";\nimport "./sfx.ts";\nexport const v = comptime(() => 1);`,
+    }));
+    assertStringIncludes(code, 'v = 1');
+    assertStringIncludes(code, '__comptime_sfx');
+});
+
+Deno.test('comptime plugin ignores type-only imports while using value imports', async () => {
+    const code = await buildFixture('type-only', 'entry.ts', () => ({
+        'types.ts': `export type Shape = { n: number };\nexport const val = 5;`,
+        'entry.ts': `
+import { comptime } from "comptime";
+import type { Shape } from "./types.ts";
+import { val } from "./types.ts";
+export const v = comptime(() => { const s: Shape = { n: val }; return s.n; });
+        `.trim(),
+    }));
+    assertStringIncludes(code, 'v = 5');
+});
+
+Deno.test('comptime plugin supports imports used both inside and outside comptime', async () => {
+    const code = await buildFixture('inside-and-outside', 'entry.ts', () => ({
+        'lib.ts': `export const N = 4;`,
+        'entry.ts': `import { comptime } from "comptime";\nimport { N } from "./lib.ts";\nexport const v = comptime(() => N * 2);\nexport const runtimeN = N;`,
+    }));
+    assertStringIncludes(code, 'v = 8');
+    assertStringIncludes(code, 'runtimeN');
+});
+
+Deno.test('comptime plugin supports a dynamic relative import inside the callback', async () => {
+    const code = await buildFixture('dynamic', 'entry.ts', () => ({
+        'dyn.ts': `export const dynValue = "dynamic!";`,
+        'entry.ts': `import { comptime } from "comptime";\nexport const v = comptime(async () => (await import("./dyn.ts")).dynValue);`,
+    }));
+    assertStringIncludes(code, '"dynamic!"');
+});
+
+Deno.test('comptime plugin supports a dynamic ../ import from a subdirectory', async () => {
+    const code = await buildFixture('dynamic-parent', 'sub/entry.ts', () => ({
+        'dyn.ts': `export const dynValue = "up-dynamic";`,
+        'sub/entry.ts': `import { comptime } from "comptime";\nexport const v = comptime(async () => (await import("../dyn.ts")).dynValue);`,
+    }));
+    assertStringIncludes(code, '"up-dynamic"');
+});
+
+Deno.test('comptime plugin supports separate calls importing different modules', async () => {
+    const code = await buildFixture('multi-module', 'entry.ts', () => ({
+        'a.ts': `export const A = "alpha";`,
+        'b.ts': `export const B = "beta";`,
+        'entry.ts': `
+import { comptime } from "comptime";
+import { A } from "./a.ts";
+import { B } from "./b.ts";
+export const first = comptime(() => A);
+export const second = comptime(() => B);
+        `.trim(),
+    }));
+    assertStringIncludes(code, '"alpha"');
+    assertStringIncludes(code, '"beta"');
+    assertEquals(code.includes('comptime('), false);
+});
+
+Deno.test('comptime plugin supports imports used by two different entry modules', async () => {
+    const code = await buildFixture('two-entries', 'entry.ts', () => ({
+        'lib.ts': `export const L = 6;`,
+        'other.ts': `import { comptime } from "comptime";\nimport { L } from "./lib.ts";\nexport const other = comptime(() => L * 7);`,
+        'entry.ts': `import { comptime } from "comptime";\nimport { L } from "./lib.ts";\nimport { other } from "./other.ts";\nexport const v = comptime(() => L) + other;`,
+    }));
+    assertStringIncludes(code, '48');
+    assertEquals(code.includes('comptime('), false);
+});
+
+// plugin integration: specifier kinds
+
+Deno.test('comptime plugin evaluates a node: import', async () => {
+    const code = await buildFixture('node-specifier', 'entry.ts', () => ({
+        'entry.ts': `import { comptime } from "comptime";\nimport { basename } from "node:path";\nexport const v = comptime(() => basename("/a/b/c.txt"));`,
+    }));
+    assertStringIncludes(code, '"c.txt"');
+});
+
+Deno.test('comptime plugin evaluates an npm: import', async () => {
+    const code = await buildFixture('npm-specifier', 'entry.ts', () => ({
+        'entry.ts': `import { comptime } from "comptime";\nimport { uneval } from "npm:devalue@^5.8.1";\nexport const v = comptime(() => uneval([1, 2]));`,
+    }));
+    assertStringIncludes(code, '"[1,2]"');
+});
+
+Deno.test('comptime plugin evaluates a jsr: import', async () => {
+    const code = await buildFixture('jsr-specifier', 'entry.ts', () => ({
+        'entry.ts': `import { comptime } from "comptime";\nimport { join as j } from "jsr:@std/path@^1.1.4";\nexport const v = comptime(() => j("a", "b"));`,
+    }));
+    assertStringIncludes(code, '"a/b"');
+});
+
+Deno.test('comptime plugin evaluates a bare import mapped by deno.json', async () => {
+    const code = await buildFixture('bare-specifier', 'entry.ts', () => ({
+        'entry.ts': `import { comptime } from "comptime";\nimport { basename } from "@std/path";\nexport const v = comptime(() => basename("/x/y.txt"));`,
+    }));
+    assertStringIncludes(code, '"y.txt"');
+});
+
+// plugin integration: values, watch and errors
+
+Deno.test('comptime plugin serializes exotic values end to end', async () => {
+    const code = await buildFixture('exotic', 'entry.ts', () => ({
+        'entry.ts': `
+import { comptime } from "comptime";
+export const m = comptime(() => new Map([["a", 1]]));
+export const s = comptime(() => new Set([1, 2]));
+export const d = comptime(() => new Date(0));
+export const r = comptime(() => /ab+c/g);
+export const b = comptime(() => 123n);
+export const u = comptime(() => undefined);
+        `.trim(),
+    }));
+    assertStringIncludes(code, 'new Map(');
+    assertStringIncludes(code, 'new Set(');
+    assertStringIncludes(code, 'new Date(0)');
+    assertStringIncludes(code, 'new RegExp("ab+c", "g")');
+    assertStringIncludes(code, '123n');
+    assertStringIncludes(code, 'void 0');
+});
+
+Deno.test('comptime plugin evaluates async callbacks that await imports', async () => {
+    const code = await buildFixture('async-import', 'entry.ts', () => ({
+        'lib.ts': `export async function fetchish() { return await Promise.resolve("awaited"); }`,
+        'entry.ts': `import { comptime } from "comptime";\nimport { fetchish } from "./lib.ts";\nexport const v = comptime(async () => await fetchish());`,
+    }));
+    assertStringIncludes(code, '"awaited"');
+});
+
+Deno.test('comptime plugin collects watch() calls without affecting the value', async () => {
+    const code = await buildFixture('watch-call', 'entry.ts', (dir) => ({
+        'watched.txt': `content-here`,
+        'entry.ts': `
+import { comptime, watch } from "comptime";
+export const v = comptime(async () => {
+  watch("${'${DIR}'.replace('${DIR}', dir)}/watched.txt");
+  return await Deno.readTextFile("${'${DIR}'.replace('${DIR}', dir)}/watched.txt");
+});
+        `.trim(),
+    }));
+    assertStringIncludes(code, '"content-here"');
+});
+
+Deno.test('comptime plugin reads a file relative to import.meta.url of the source', async () => {
+    const code = await buildFixture('import-meta', 'entry.ts', () => ({
+        'meta.txt': `meta-content`,
+        'entry.ts': `
+import { comptime } from "comptime";
+export const v = comptime(async () => {
+  const url = new URL("./meta.txt", import.meta.url);
+  return await Deno.readTextFile(url);
+});
+        `.trim(),
+    }));
+    assertStringIncludes(code, '"meta-content"');
+});
+
+Deno.test('comptime plugin surfaces errors thrown inside the callback', async () => {
+    await assertRejects(
+        () =>
+            buildFixture('throwing', 'entry.ts', () => ({
+                'entry.ts': `import { comptime } from "comptime";\nexport const v = comptime(() => { throw new Error("boom-inside"); });`,
+            })),
+        Error,
+        'boom-inside',
+    );
+});
+
+Deno.test('comptime plugin surfaces unserializable return values', async () => {
+    await assertRejects(
+        () =>
+            buildFixture('unserializable', 'entry.ts', () => ({
+                'entry.ts': `import { comptime } from "comptime";\nexport const v = comptime(() => () => 1);`,
+            })),
+        Error,
+        'cannot be serialized',
+    );
+});
+
+Deno.test('comptime plugin surfaces failures importing a missing module in the callback', async () => {
+    await assertRejects(
+        () =>
+            buildFixture('missing-dynamic', 'entry.ts', () => ({
+                'entry.ts': `import { comptime } from "comptime";\nexport const v = comptime(async () => (await import("./nope.ts")).x);`,
+            })),
+        Error,
+        'comptime',
+    );
+});
+
+// known limitations (asserting current behaviour)
+
+Deno.test(
+    'BUG: imports referenced only by an inlined top-level declaration are not hoisted',
+    async () => {
+        const src = await virtualSourceFor(
+            `
+import { comptime } from "comptime";
+import { HV } from "./h.ts";
+const helper = () => HV * 2;
+export const x = comptime(() => helper());
+        `.trim(),
+        );
+        assertStringIncludes(src, 'const helper = () => HV * 2;');
+        // The import that `helper` depends on is missing from the virtual module.
+        assertEquals(src.includes('/src/h.ts'), false);
+    },
+);
+
+Deno.test(
+    'BUG: a comptime callback depending on an import via a helper fails at build time',
+    async () => {
+        await assertRejects(
+            () =>
+                buildFixture('helper-import-bug', 'entry.ts', () => ({
+                    'h.ts': `export const HV = 10;`,
+                    'entry.ts': `
+import { comptime } from "comptime";
+import { HV } from "./h.ts";
+const helper = () => HV * 2;
+export const v = comptime(() => helper());
+                    `.trim(),
+                })),
+            Error,
+            'HV is not defined',
+        );
+    },
+);
+
+Deno.test('nested comptime calls leave the inner call unresolved in the virtual module', async () => {
+    const src = await virtualSourceFor(
+        `import { comptime } from "comptime";\nexport const x = comptime(() => comptime(() => 1));`,
+    );
+    assertStringIncludes(src, 'comptime(() => 1)');
+    assertEquals(src.includes('import { comptime }'), false);
 });
