@@ -79,6 +79,29 @@ export const ROUTES = comptime(() => {
 
 `watch` is a no-op at runtime and is excluded from the evaluation module's imports.
 
+## Caching
+
+Each `comptime()` call is evaluated once per plugin instance and the result is cached. The cache key is the content of the generated evaluation module (the hoisted imports, inlined declarations and the callback body) plus the values of any `Deno.env.get("KEY")` calls it makes. That key names imported modules by *path*, so it cannot see their contents changing. Each entry therefore also records a content hash of the files the evaluation is known to depend on, and an entry is only reused while those hashes still match.
+
+**Tracked** — editing one of these between builds gives a fresh value on the next build, watch mode or not:
+
+- local files behind the imports the callback actually uses,
+- every path passed to `watch()`.
+
+An edit that lands *while* an evaluation is running is a different matter: the literal being produced may already be out of date. Imports are hashed before evaluation starts, so for those the edit costs a re-evaluation rather than a wrong value. `watch()` paths cannot be hashed ahead of time — they are not known until the callback has run — so they are instead only recorded once the filesystem says they held still: the later of a file's `mtime` and `ctime` (and, if it is gone, the same pair for the directory that held it, which is what distinguishes a mid-evaluation deletion from a file that never existed) must predate the start of the evaluation by at least two seconds.
+
+That check is only as good as the timestamps. `ctime` covers the cases where `mtime` is preserved or moved backwards across a write (`cp -p`, `rsync --times`), and the two-second margin covers coarse-grained filesystems, but a filesystem whose clock genuinely runs behind this process — a skewed container, some network mounts — can still report a concurrent write as an old one and pin a stale value for the lifetime of the entry. Removing a whole directory tree mid-evaluation is likewise not detected.
+
+**Not tracked** — editing one of these can still yield a stale value within the lifetime of a plugin instance:
+
+- _transitive_ imports. Only the file a callback imports directly is hashed, not what that file imports in turn. Call `watch()` on the transitive file if it matters.
+- files read during evaluation (`Deno.readTextFile`, `fetch` to a local server, ...) without a matching `watch()` call. `watch()` is what makes such a read a declared dependency.
+- `npm:`, `jsr:` and `node:` specifiers, which are pinned by version rather than by content. An argument to `watch()` carrying a scheme (`npm:`, `http:`, ...) is likewise not a path and is ignored.
+
+A file that cannot be read - missing, a directory, permission denied - is not an error: it is recorded as unreadable, and the entry is invalidated as soon as that changes.
+
+In `--watch` mode this is all belt and braces: `watchChange` clears the whole cache, so any change to a file registered with Rolldown re-evaluates everything regardless.
+
 ## Options
 
 ```ts

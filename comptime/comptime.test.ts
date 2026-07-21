@@ -20,6 +20,7 @@ import {
     collectTopLevelDeclarations,
     ComptimeTransformError,
     findComptimeCalls,
+    hasUriScheme,
     isLocalFile,
     normalizeToForwardSlashes,
     resolveSpecifier,
@@ -1951,6 +1952,336 @@ Deno.test('createCore cache key includes referenced Deno.env values', async () =
     } finally {
         Deno.env.delete('COMPTIME_TEST_KEY');
     }
+});
+
+// createCore: cache entries are validated against their dependencies
+
+// A fresh directory per run, so neither a crashed earlier run's leftovers nor a
+// concurrent `deno test` can decide what these tests observe on disk.
+async function withDepsFixture(body: (dir: string) => Promise<void>): Promise<void> {
+    const dir = (await Deno.makeTempDir({ prefix: 'comptime-deps-' })).replace(
+        /\\/g,
+        '/',
+    );
+    try {
+        await body(dir);
+    } finally {
+        await Deno.remove(dir, { recursive: true }).catch(() => {});
+    }
+}
+
+Deno.test('createCore re-evaluates when a hoisted import changes on disk', async () => {
+    await withDepsFixture(async (dir) => {
+        const lib = join(dir, 'lib.ts');
+        await Deno.writeTextFile(lib, `export const N = 1;`);
+        const core = createCore(new RolldownEvaluator(), {});
+        const code = `import { comptime } from "comptime";\nimport { N } from "./lib.ts";\nexport const x = comptime(() => N);`;
+        const first = await core.transform(code, join(dir, 'entry.ts'), {});
+        assertStringIncludes(first!.code, 'x = 1');
+
+        await Deno.writeTextFile(lib, `export const N = 2;`);
+        const second = await core.transform(code, join(dir, 'entry.ts'), {});
+        assertStringIncludes(second!.code, 'x = 2');
+    });
+});
+
+Deno.test("createCore re-evaluates when a file passed to watch() changes", async () => {
+    await withDepsFixture(async (dir) => {
+        const data = join(dir, 'data.txt').replace(/\\/g, '/');
+        await Deno.writeTextFile(data, 'first');
+        const core = createCore(new RolldownEvaluator(), {});
+        const code = `
+import { comptime, watch } from "comptime";
+export const x = comptime(async () => {
+  watch("${data}");
+  return await Deno.readTextFile("${data}");
+});
+        `.trim();
+        const first = await core.transform(code, join(dir, 'entry.ts'), {});
+        assertStringIncludes(first!.code, '"first"');
+
+        await Deno.writeTextFile(data, 'second');
+        const second = await core.transform(code, join(dir, 'entry.ts'), {});
+        assertStringIncludes(second!.code, '"second"');
+    });
+});
+
+// Not covered by the dependency stamps: only the directly imported file is
+// stamped, never what it imports in turn. Pinned so the documented limit and the
+// behaviour cannot drift apart; `watch()` is the workaround.
+Deno.test(
+    'createCore does not re-evaluate when a transitive import of a hoisted module changes',
+    async () => {
+        await withDepsFixture(async (dir) => {
+            const leaf = join(dir, 'leaf.ts');
+            await Deno.writeTextFile(leaf, `export const LEAF = 1;`);
+            await Deno.writeTextFile(
+                join(dir, 'lib.ts'),
+                `import { LEAF } from "./leaf.ts";\nexport const N = LEAF;`,
+            );
+            const core = createCore(new RolldownEvaluator(), {});
+            const code = `import { comptime } from "comptime";\nimport { N } from "./lib.ts";\nexport const x = comptime(() => N);`;
+            const first = await core.transform(code, join(dir, 'entry.ts'), {});
+            assertStringIncludes(first!.code, 'x = 1');
+
+            await Deno.writeTextFile(leaf, `export const LEAF = 2;`);
+            const second = await core.transform(code, join(dir, 'entry.ts'), {});
+            assertStringIncludes(second!.code, 'x = 1');
+
+            // ...until the cache is dropped, which watch mode does on any change.
+            core.invalidate();
+            const third = await core.transform(code, join(dir, 'entry.ts'), {});
+            assertStringIncludes(third!.code, 'x = 2');
+        });
+    },
+);
+
+// Not covered either: a file the callback reads at evaluation time without
+// declaring it through watch() is not a known dependency. The plugin-level test
+// 'comptime plugin watchChange invalidates the cache' pins the same limit.
+Deno.test('createCore does not re-evaluate for an undeclared runtime read', async () => {
+    await withDepsFixture(async (dir) => {
+        const data = join(dir, 'data.txt').replace(/\\/g, '/');
+        await Deno.writeTextFile(data, 'first');
+        const core = createCore(new RolldownEvaluator(), {});
+        const code = `import { comptime } from "comptime";\nexport const x = comptime(async () => await Deno.readTextFile("${data}"));`;
+        const first = await core.transform(code, join(dir, 'entry.ts'), {});
+        assertStringIncludes(first!.code, '"first"');
+
+        await Deno.writeTextFile(data, 'second');
+        const second = await core.transform(code, join(dir, 'entry.ts'), {});
+        assertStringIncludes(second!.code, '"first"');
+    });
+});
+
+Deno.test('createCore keeps caching when a dependency cannot be read', async () => {
+    let count = 0;
+    const counting = {
+        evaluate: (): Promise<EvaluateResult> => {
+            count++;
+            return Promise.resolve({ value: 1, watchFiles: ['/does/not/exist.json'] });
+        },
+    };
+    const core = createCore(counting as any, {});
+    // Neither the import nor the watched path exists; both stamp as unreadable,
+    // which is a stable state, so the second transform is still a cache hit.
+    const code = `import { comptime } from "comptime";\nimport { a } from "./missing.ts";\nexport const x = comptime(() => a);`;
+    await core.transform(code, '/no/such/dir/f.ts', {});
+    await core.transform(code, '/no/such/dir/f.ts', {});
+    assertEquals(count, 1);
+});
+
+Deno.test('createCore re-evaluates once a missing dependency appears', async () => {
+    await withDepsFixture(async (dir) => {
+        let count = 0;
+        const counting = {
+            evaluate: (): Promise<EvaluateResult> => {
+                count++;
+                return Promise.resolve({ value: count, watchFiles: [] });
+            },
+        };
+        const core = createCore(counting as any, {});
+        const code = `import { comptime } from "comptime";\nimport { a } from "./lib.ts";\nexport const x = comptime(() => a);`;
+        await core.transform(code, join(dir, 'entry.ts'), {});
+        assertEquals(count, 1);
+
+        await Deno.writeTextFile(join(dir, 'lib.ts'), `export const a = 1;`);
+        await core.transform(code, join(dir, 'entry.ts'), {});
+        assertEquals(count, 2);
+    });
+});
+
+Deno.test('createCore tolerates a dependency that is a directory', async () => {
+    await withDepsFixture(async (dir) => {
+        await ensureDir(join(dir, 'lib.ts'));
+        const rec = recordingEvaluator(7);
+        const core = createCore(rec as any, {});
+        const code = `import { comptime } from "comptime";\nimport { a } from "./lib.ts";\nexport const x = comptime(() => a);`;
+        const result = await core.transform(code, join(dir, 'entry.ts'), {});
+        assertStringIncludes(result!.code, 'x = 7');
+        await core.transform(code, join(dir, 'entry.ts'), {});
+        // A directory opens but cannot be read, which is a stable observation, so
+        // the entry is still reused rather than re-evaluated.
+        assertEquals(rec.sources.length, 1);
+    });
+});
+
+// Stamps must only ever be too old, never too new. These two pin the interleaving
+// that decides it: a dependency edited while the evaluation is running.
+
+Deno.test(
+    'createCore does not cache a literal a mid-evaluation import edit superseded',
+    async () => {
+        await withDepsFixture(async (dir) => {
+            const lib = join(dir, 'lib.ts').replace(/\\/g, '/');
+            await Deno.writeTextFile(lib, `export const N = 1;`);
+            let count = 0;
+            const editing = {
+                evaluate: (): Promise<EvaluateResult> => {
+                    count++;
+                    // Stands in for a build that read the old content and an editor
+                    // that saved over it while that build was still running. It runs
+                    // in the same synchronous turn as the stamping, so an un-awaited
+                    // stamp read cannot have completed before it.
+                    Deno.writeTextFileSync(lib, `export const N = 2;`);
+                    return Promise.resolve({ value: count, watchFiles: [] });
+                },
+            };
+            const core = createCore(editing as any, {});
+            const code = `import { comptime } from "comptime";\nimport { N } from "./lib.ts";\nexport const x = comptime(() => N);`;
+            await core.transform(code, join(dir, 'entry.ts'), {});
+            assertEquals(count, 1);
+
+            // The stamp describes the pre-edit content, so the entry is correctly
+            // rejected on the next transform instead of pinning the old literal.
+            await core.transform(code, join(dir, 'entry.ts'), {});
+            assertEquals(count, 2);
+        });
+    },
+);
+
+Deno.test(
+    'createCore does not cache a literal a mid-evaluation watch() edit superseded',
+    async () => {
+        await withDepsFixture(async (dir) => {
+            const data = join(dir, 'data.txt').replace(/\\/g, '/');
+            await Deno.writeTextFile(data, 'first');
+            let count = 0;
+            const editing = {
+                evaluate: (): Promise<EvaluateResult> => {
+                    count++;
+                    const seen = Deno.readTextFileSync(data);
+                    // The callback has read the file; the edit lands before the
+                    // evaluation returns, so `seen` is already superseded.
+                    Deno.writeTextFileSync(data, `edit-${count}`);
+                    return Promise.resolve({ value: seen, watchFiles: [data] });
+                },
+            };
+            const core = createCore(editing as any, {});
+            const code = `import { comptime, watch } from "comptime";\nexport const x = comptime(() => { watch("${data}"); return 1; });`;
+            const first = await core.transform(code, join(dir, 'entry.ts'), {});
+            assertStringIncludes(first!.code, '"first"');
+
+            // Stamping after evaluation would have recorded the post-edit content
+            // against the pre-edit literal, making that literal permanent.
+            const second = await core.transform(code, join(dir, 'entry.ts'), {});
+            assertStringIncludes(second!.code, '"edit-1"');
+            const third = await core.transform(code, join(dir, 'entry.ts'), {});
+            assertStringIncludes(third!.code, '"edit-2"');
+        });
+    },
+);
+
+Deno.test(
+    'createCore does not cache when a mid-evaluation edit preserves the old mtime',
+    async () => {
+        await withDepsFixture(async (dir) => {
+            const data = join(dir, 'data.txt').replace(/\\/g, '/');
+            await Deno.writeTextFile(data, 'first');
+            let count = 0;
+            const editing = {
+                evaluate: (): Promise<EvaluateResult> => {
+                    count++;
+                    const seen = Deno.readTextFileSync(data);
+                    Deno.writeTextFileSync(data, `edit-${count}`);
+                    // What `cp -p`, `rsync --times` and mtime-preserving editors
+                    // do: the content moved on but mtime says it did not, and
+                    // says so from well before the evaluation began.
+                    const past = new Date(Date.now() - 60_000);
+                    Deno.utimeSync(data, past, past);
+                    return Promise.resolve({ value: seen, watchFiles: [data] });
+                },
+            };
+            const core = createCore(editing as any, {});
+            const code = `import { comptime, watch } from "comptime";\nexport const x = comptime(() => { watch("${data}"); return 1; });`;
+            const first = await core.transform(code, join(dir, 'entry.ts'), {});
+            assertStringIncludes(first!.code, '"first"');
+
+            // ctime is not settable and moves even here, so the entry is still
+            // rejected rather than pinning the pre-edit literal forever.
+            const second = await core.transform(code, join(dir, 'entry.ts'), {});
+            assertStringIncludes(second!.code, '"edit-1"');
+            const third = await core.transform(code, join(dir, 'entry.ts'), {});
+            assertStringIncludes(third!.code, '"edit-2"');
+        });
+    },
+);
+
+Deno.test(
+    'createCore does not cache when a watched file is deleted mid-evaluation',
+    async () => {
+        await withDepsFixture(async (dir) => {
+            const data = join(dir, 'data.txt').replace(/\\/g, '/');
+            await Deno.writeTextFile(data, 'first');
+            const editing = {
+                evaluate: (): Promise<EvaluateResult> => {
+                    let seen = 'gone';
+                    try {
+                        seen = Deno.readTextFileSync(data);
+                        Deno.removeSync(data);
+                    } catch {
+                        // Already removed by the previous evaluation.
+                    }
+                    return Promise.resolve({ value: seen, watchFiles: [data] });
+                },
+            };
+            const core = createCore(editing as any, {});
+            const code = `import { comptime, watch } from "comptime";\nexport const x = comptime(() => { watch("${data}"); return 1; });`;
+            const first = await core.transform(code, join(dir, 'entry.ts'), {});
+            assertStringIncludes(first!.code, '"first"');
+
+            // A deleted file stamps as unreadable exactly like one that never
+            // existed; the mtime of the directory that held it is what tells the
+            // two apart, so this is not pinned as valid.
+            const second = await core.transform(code, join(dir, 'entry.ts'), {});
+            assertStringIncludes(second!.code, '"gone"');
+        });
+    },
+);
+
+Deno.test(
+    'createCore does not stamp watch() arguments carrying a URI scheme',
+    async () => {
+        const scheme = ['npm:lodash', 'jsr:@std/path', 'https://example.com/x.json'];
+        const evaluator = {
+            evaluate: (): Promise<EvaluateResult> =>
+                // The local path deliberately sits under a directory that cannot
+                // exist: its parent then stats as absent, which is a stable
+                // "unmodified" answer. A path relative to the cwd would instead
+                // ride on the repo root's mtime and fail whenever anything was
+                // written there within the slack window.
+                Promise.resolve({
+                    value: 1,
+                    watchFiles: [...scheme, '/no/such/dir/local.json'],
+                }),
+        };
+        const opened: string[] = [];
+        const realOpen = Deno.open;
+        (Deno as any).open = (path: string | URL, opts?: Deno.OpenOptions) => {
+            opened.push(String(path));
+            return realOpen(path, opts);
+        };
+        try {
+            const core = createCore(evaluator as any, {});
+            const code = `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`;
+            // Twice, so both the recording pass and the validating pass are covered.
+            await core.transform(code, '/src/f.ts', {});
+            await core.transform(code, '/src/f.ts', {});
+        } finally {
+            (Deno as any).open = realOpen;
+        }
+        // Not files: opening them can only ever fail, and recording them would add a
+        // dependency that can never invalidate. A plain relative path still counts.
+        assertEquals(opened.filter((p) => scheme.includes(p)), []);
+        assertEquals(opened.includes('/no/such/dir/local.json'), true);
+    },
+);
+
+Deno.test('hasUriScheme distinguishes specifiers from relative paths', () => {
+    for (const s of ['npm:lodash', 'jsr:@std/path', 'node:fs', 'https://x/y.json'])
+        assertEquals(hasUriScheme(s), true);
+    for (const p of ['./local.json', '../up.json', 'data.json', 'C:/win.json'])
+        assertEquals(hasUriScheme(p), false);
 });
 
 // createCore: options and results
