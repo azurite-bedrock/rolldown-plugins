@@ -1717,10 +1717,14 @@ export const y = comptime(() => b);
         {},
     );
     assertEquals(rec.sources.length, 2);
-    assertStringIncludes(rec.sources[0], '/src/a.ts');
-    assertEquals(rec.sources[0].includes('/src/b.ts'), false);
-    assertStringIncludes(rec.sources[1], '/src/b.ts');
-    assertEquals(rec.sources[1].includes('/src/a.ts'), false);
+    // Calls are evaluated concurrently, so identify each virtual module by its
+    // callback body rather than by the order the evaluator saw it.
+    const forA = rec.sources.find((s) => s.includes('return (a);'))!;
+    const forB = rec.sources.find((s) => s.includes('return (b);'))!;
+    assertStringIncludes(forA, '/src/a.ts');
+    assertEquals(forA.includes('/src/b.ts'), false);
+    assertStringIncludes(forB, '/src/b.ts');
+    assertEquals(forB.includes('/src/a.ts'), false);
 });
 
 Deno.test('createCore inlines top-level declarations referenced by the callback', async () => {
@@ -2007,13 +2011,17 @@ Deno.test('createCore.transform honours an aliased comptime import', async () =>
 });
 
 Deno.test('createCore.transform replaces every call in a file', async () => {
-    const values = [1, 'two', { three: 3 }];
-    let i = 0;
-    const seq = {
-        evaluate: (): Promise<EvaluateResult> =>
-            Promise.resolve({ value: values[i++], watchFiles: [] }),
+    // Calls are evaluated concurrently, so the mock keys off the callback body in
+    // the virtual module rather than off invocation order.
+    const values: Record<string, unknown> = { '1': 1, '2': 'two', '3': { three: 3 } };
+    const byBody = {
+        evaluate: (_id: string, src: string): Promise<EvaluateResult> =>
+            Promise.resolve({
+                value: values[src.match(/return \((\d)\);/)![1]],
+                watchFiles: [],
+            }),
     };
-    const core = createCore(seq as any, {});
+    const core = createCore(byBody as any, {});
     const result = await core.transform(
         `
 import { comptime } from "comptime";
@@ -2078,11 +2086,13 @@ Deno.test('createCore.transform forwards innerPlugins to the evaluator', async (
 });
 
 Deno.test('createCore.transform passes a distinct virtual id per call index', async () => {
-    const ids: string[] = [];
+    // Calls are evaluated concurrently, so each id is tied back to its own call
+    // through the callback body rather than through invocation order.
+    const idByBody = new Map<string, string>();
     const core = createCore(
         {
-            evaluate: (id: string) => {
-                ids.push(id);
+            evaluate: (id: string, src: string) => {
+                idByBody.set(src.match(/return \((\d)\);/)![1], id);
                 return Promise.resolve({ value: 1, watchFiles: [] });
             },
         } as any,
@@ -2093,10 +2103,9 @@ Deno.test('createCore.transform passes a distinct virtual id per call index', as
         '/src/f.ts',
         {},
     );
-    assertEquals(ids, [
-        '\0comptime:/src/f.ts?comptime=0',
-        '\0comptime:/src/f.ts?comptime=1',
-    ]);
+    assertEquals(idByBody.size, 2);
+    assertEquals(idByBody.get('1'), '\0comptime:/src/f.ts?comptime=0');
+    assertEquals(idByBody.get('2'), '\0comptime:/src/f.ts?comptime=1');
 });
 
 Deno.test('createCore.transform produces a source map naming the original file', async () => {
