@@ -2147,6 +2147,37 @@ Deno.test('createCore.transform reports loc and frame for evaluation errors', as
     assertEquals(err.frame, 'export const x = comptime(() => 1);\n                 ^');
 });
 
+Deno.test('createCore.transform reports the earliest failing call when several fail', async () => {
+    // The second call fails immediately while the first is still pending, so
+    // reporting whichever rejection lands first would surface the second one.
+    // The staggered delays are what make this a regression test: with both at
+    // 0ms it would pass even without source-order selection.
+    const core = createCore(
+        {
+            evaluate: (_id: string, src: string) =>
+                new Promise((_, reject) => {
+                    const isFirst = src.includes('return (1);');
+                    setTimeout(
+                        () => reject(new Error(isFirst ? 'first' : 'second')),
+                        isFirst ? 20 : 0,
+                    );
+                }),
+        } as any,
+        {},
+    );
+    const err = await assertRejects(
+        () =>
+            core.transform(
+                `import { comptime } from "comptime";\nexport const a = comptime(() => 1);\nexport const b = comptime(() => 2);`,
+                '/src/f.ts',
+                {},
+            ),
+        ComptimeTransformError,
+        'comptime evaluation threw: first',
+    );
+    assertEquals(err.loc.line, 2);
+});
+
 Deno.test('createCore.transform does not double-prefix messages already starting with comptime', async () => {
     const core = createCore(
         { evaluate: () => Promise.reject(new Error('comptime inner build failed: nope')) } as any,
