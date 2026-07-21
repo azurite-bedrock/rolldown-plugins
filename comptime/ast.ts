@@ -1,54 +1,7 @@
-import micromatch from 'micromatch';
 import { parseSync } from 'rolldown/experimental';
-import { resolve } from '@std/path';
+import { resolveSpecifier } from './paths.ts';
 
 export { parseSync };
-
-export type Loc = { file: string; line: number; column: number };
-
-export class ComptimeTransformError extends Error {
-    readonly loc: Loc;
-    readonly frame: string;
-
-    constructor(message: string, loc: Loc, frame: string) {
-        super(message);
-        this.name = 'ComptimeTransformError';
-        this.loc = loc;
-        this.frame = frame;
-    }
-}
-
-const SUPPORTED_EXTENSIONS = new Set([
-    '.js',
-    '.jsx',
-    '.mjs',
-    '.cjs',
-    '.ts',
-    '.tsx',
-    '.mts',
-    '.cts',
-]);
-
-export type ComptimeOptions = {
-    include?: string | string[];
-    exclude?: string | string[];
-    timeout?: number;
-    innerPlugins?: unknown[];
-    serializers?: Array<{
-        test: (value: unknown) => boolean;
-        serialize: (value: unknown) => string;
-    }>;
-};
-
-export function shouldScan(code: string, id: string, options: ComptimeOptions): boolean {
-    if (id.startsWith('\0')) return false;
-    const dotIdx = id.lastIndexOf('.');
-    if (dotIdx === -1 || !SUPPORTED_EXTENSIONS.has(id.slice(dotIdx))) return false;
-    if (!code.includes('comptime')) return false;
-    if (options.exclude && micromatch.isMatch(id, options.exclude)) return false;
-    if (options.include && !micromatch.isMatch(id, options.include)) return false;
-    return true;
-}
 
 export type ComptimeBindings = { comptimeNames: Set<string>; watchNames: Set<string> };
 
@@ -168,36 +121,6 @@ export type ImportBinding = {
     absSpecifier: string;
     originalSpecifier: string;
 };
-
-export function normalizeToForwardSlashes(p: string): string {
-    return p.replace(/\\/g, '/');
-}
-
-function isWindowsDrivePath(p: string): boolean {
-    return /^[A-Za-z]:[\\/]/.test(p);
-}
-
-export function isLocalFile(p: string): boolean {
-    return p.startsWith('/') || isWindowsDrivePath(p);
-}
-
-/**
- * Whether `p` carries a URI scheme (`npm:`, `jsr:`, `node:`, `http:`, ...) and so
- * does not name a file on disk. Requires at least two characters before the
- * colon, which is what keeps a Windows drive path (`C:/x`) out.
- */
-export function hasUriScheme(p: string): boolean {
-    return /^[A-Za-z][A-Za-z0-9+.-]+:/.test(p);
-}
-
-export function resolveSpecifier(spec: string, fileDir: string): string {
-    // Bare module specifier (npm:, jsr:, etc.)
-    if (!spec.startsWith('.') && !spec.startsWith('/') && !isWindowsDrivePath(spec))
-        return spec;
-    // native resolve handles both POSIX and Windows drive-letter paths;
-    // normalize output to forward slashes for consistency.
-    return normalizeToForwardSlashes(resolve(fileDir, spec));
-}
 
 export function collectImportBindings(
     program: any,

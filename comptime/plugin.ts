@@ -1,37 +1,30 @@
-import type { Plugin, TransformResult as RolldownTransformResult } from 'rolldown';
+import type { Plugin } from 'rolldown';
 import { RolldownEvaluator } from './evaluator.ts';
-import { createCore } from './core.ts';
-import type { ComptimeOptions } from './ast.ts';
+import { createTransformer } from './transform.ts';
+import type { ComptimeOptions } from './options.ts';
+
+/**
+ * `enforce` is a Vite-compatibility field: rolldown's own `Plugin` does not
+ * declare it, but hosts that honour plugin ordering read it, so it is kept and
+ * declared here rather than cast away.
+ */
+type ComptimePlugin = Plugin & { enforce: 'pre' };
 
 export function comptime(options: ComptimeOptions = {}): Plugin {
-    const evaluator = new RolldownEvaluator();
-    const core = createCore(evaluator, options);
+    const transformer = createTransformer(new RolldownEvaluator(), options);
 
-    return {
+    const plugin: ComptimePlugin = {
         name: 'comptime',
         enforce: 'pre',
-        resolveId(id: string) {
-            return core.resolveId(id);
-        },
-        load(id: string) {
-            return core.load(id);
-        },
-        async transform(
-            this: { addWatchFile?: (id: string) => void },
-            code: string,
-            id: string,
-        ) {
-            const result = await core.transform(code, id, {
-                addWatchFile: this.addWatchFile?.bind(this),
-            });
-            if (!result) return undefined;
-            return {
-                code: result.code,
-                map: result.map,
-            } as unknown as RolldownTransformResult;
+        async transform(code, id) {
+            // `this` is rolldown's transform context; the transformer only ever
+            // reaches for `addWatchFile`, and calling it as a method keeps its
+            // receiver, so nothing needs binding.
+            return (await transformer.transform(code, id, this)) ?? undefined;
         },
         watchChange() {
-            core.invalidate();
+            transformer.invalidate();
         },
-    } as Plugin;
+    };
+    return plugin;
 }

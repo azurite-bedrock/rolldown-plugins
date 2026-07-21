@@ -5,6 +5,19 @@ import { dirname, join } from "@std/path";
 
 export type EvaluateResult = { value: unknown; watchFiles: string[] };
 
+/**
+ * Evaluates one virtual module and reports what it produced. Named as an
+ * interface rather than the concrete class so a caller - a test above all - can
+ * supply an evaluator that does not run a real inner build.
+ */
+export type Evaluator = {
+    evaluate(
+        virtualId: string,
+        virtualSource: string,
+        innerPlugins?: Plugin[],
+    ): Promise<EvaluateResult>;
+};
+
 export class RolldownEvaluator {
     readonly #virtualModules = new Map<string, string>();
     #evalCount = 0;

@@ -1,5 +1,6 @@
 import { uneval } from 'devalue';
-import type { ImportBinding, TopLevelDecl, ComptimeOptions } from './ast.ts';
+import type { ImportBinding, TopLevelDecl } from './ast.ts';
+import type { ComptimeOptions } from './options.ts';
 
 export function createVirtualModule(
     importBindings: ImportBinding[],
