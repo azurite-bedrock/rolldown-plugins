@@ -27,7 +27,16 @@ export function createVirtualModule(
     }
 
     lines.push('const __comptime_watch_files = [];');
-    lines.push('const watch = (path) => __comptime_watch_files.push(path);');
+    // The synthetic `watch` stands in for the `watch` export of the 'comptime'
+    // module, which is never hoisted here. A hoisted binding of the same name
+    // always comes from somewhere else (the two cannot coexist in the source
+    // file - that would be a duplicate declaration), so it must win.
+    const declaresWatch =
+        importBindings.some((b) => b.localName === 'watch') ||
+        topLevelDecls.some((d) => d.names.includes('watch'));
+    if (!declaresWatch) {
+        lines.push('const watch = (path) => __comptime_watch_files.push(path);');
+    }
     lines.push(`let __comptime_result = await (async () => { ${bodyStatements} })();`);
     lines.push(
         'export { __comptime_result as default, __comptime_watch_files as __comptime_watch };',

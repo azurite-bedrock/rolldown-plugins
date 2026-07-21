@@ -181,7 +181,6 @@ export function resolveSpecifier(spec: string, fileDir: string): string {
 export function collectImportBindings(
     program: any,
     fileDir: string,
-    watchNames: Set<string>,
 ): Map<string, ImportBinding> {
     const bindings = new Map<string, ImportBinding>();
     for (const node of program.body) {
@@ -193,7 +192,6 @@ export function collectImportBindings(
         for (const s of node.specifiers) {
             if ((s as any).importKind === 'type') continue;
             const localName: string = s.local.name;
-            if (watchNames.has(localName)) continue;
             const importedName: string =
                 s.type === 'ImportDefaultSpecifier'
                     ? 'default'

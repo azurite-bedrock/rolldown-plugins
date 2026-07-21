@@ -84,7 +84,7 @@ export function createCore(
             if (!shouldScan(code, id, options)) return null;
 
             const { program } = parseSync(id, code, { lang: 'ts', sourceType: 'module' });
-            const { comptimeNames, watchNames } = collectComptimeBindings(program);
+            const { comptimeNames } = collectComptimeBindings(program);
             if (comptimeNames.size === 0) return null;
 
             const calls = findComptimeCalls(program, comptimeNames);
@@ -93,7 +93,7 @@ export function createCore(
             const fileDir = normalizeToForwardSlashes(
                 dirname(normalizeToForwardSlashes(id)),
             );
-            const importBindings = collectImportBindings(program, fileDir, watchNames);
+            const importBindings = collectImportBindings(program, fileDir);
             const topLevelDecls = collectTopLevelDeclarations(program, code);
             const s = new MagicString(code);
 

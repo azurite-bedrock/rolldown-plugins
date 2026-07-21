@@ -245,8 +245,7 @@ Deno.test("collectImportBindings excludes the 'comptime' import", () => {
         lang: 'ts',
         sourceType: 'module',
     });
-    const { watchNames } = collectComptimeBindings(program);
-    const bindings = collectImportBindings(program, '/src', watchNames);
+    const bindings = collectImportBindings(program, '/src');
     assertEquals(bindings.has('comptime'), false);
     assertEquals(bindings.has('watch'), false);
     assertEquals(
@@ -261,7 +260,7 @@ Deno.test('collectImportBindings passes npm: specifiers through unchanged', () =
         lang: 'ts',
         sourceType: 'module',
     });
-    const bindings = collectImportBindings(program, '/src', new Set());
+    const bindings = collectImportBindings(program, '/src');
     assertEquals(bindings.get('something')!.absSpecifier, 'npm:some-lib');
 });
 
@@ -271,7 +270,7 @@ Deno.test('collectImportBindings handles default and namespace imports', () => {
         lang: 'ts',
         sourceType: 'module',
     });
-    const bindings = collectImportBindings(program, '/src', new Set());
+    const bindings = collectImportBindings(program, '/src');
     assertEquals(bindings.get('Foo')!.importedName, 'default');
     assertEquals(bindings.get('Bar')!.importedName, '*');
 });
@@ -341,6 +340,19 @@ Deno.test('createVirtualModule injects watch() synthetic function', () => {
     assertEquals(src.includes('const __comptime_watch_files = []'), true);
     assertEquals(src.includes('const watch = (path)'), true);
     assertEquals(src.includes('__comptime_watch_files.push(path)'), true);
+});
+
+Deno.test('createVirtualModule omits the watch shim when an import binds watch', () => {
+    const binding: ImportBinding = {
+        localName: 'watch',
+        importedName: 'watch',
+        absSpecifier: '/abs/fs-helpers.ts',
+        originalSpecifier: './fs-helpers.ts',
+    };
+    const src = createVirtualModule([binding], [], `return watch("a.txt");`);
+    assertEquals(src.includes('const watch = (path)'), false);
+    assertEquals(src.includes(`import { watch } from "/abs/fs-helpers.ts"`), true);
+    assertEquals(src.includes('const __comptime_watch_files = []'), true);
 });
 
 Deno.test('createVirtualModule exports default and __comptime_watch', () => {
@@ -750,6 +762,39 @@ export const value = comptime(() => triple(14));
     }
 });
 
+Deno.test('comptime plugin evaluates a body using a watch import from another module', async () => {
+    await setup();
+    let build: Awaited<ReturnType<typeof rolldown>> | undefined;
+    try {
+        const helperFile = join(FIXTURE_DIR, 'fs-helpers.ts');
+        const entry = join(FIXTURE_DIR, 'watch-name.ts');
+        await Deno.writeTextFile(
+            helperFile,
+            `export function watch(path: string) { return "watching:" + path; }`,
+        );
+        await Deno.writeTextFile(
+            entry,
+            `
+import { comptime } from "comptime";
+import { watch } from "./fs-helpers.ts";
+export const value = comptime(() => watch("config.json"));
+    `.trim(),
+        );
+
+        build = await rolldown({
+            input: entry,
+            plugins: [aliasComptime(), comptimePlugin()],
+        });
+        const { output } = await build.generate({ format: 'esm' });
+
+        assertStringIncludes(output[0].code, '"watching:config.json"');
+        assertEquals(output[0].code.includes('comptime('), false);
+    } finally {
+        await build?.close();
+        await teardown();
+    }
+});
+
 // shouldScan extended
 
 Deno.test('shouldScan accepts every supported extension', () => {
@@ -947,7 +992,7 @@ Deno.test('collectImportBindings skips `import type` declarations', () => {
         lang: 'ts',
         sourceType: 'module',
     });
-    assertEquals(collectImportBindings(program, '/src', new Set()).size, 0);
+    assertEquals(collectImportBindings(program, '/src').size, 0);
 });
 
 Deno.test('collectImportBindings skips inline `type` specifiers but keeps values', () => {
@@ -956,7 +1001,7 @@ Deno.test('collectImportBindings skips inline `type` specifiers but keeps values
         lang: 'ts',
         sourceType: 'module',
     });
-    const bindings = collectImportBindings(program, '/src', new Set());
+    const bindings = collectImportBindings(program, '/src');
     assertEquals([...bindings.keys()], ['B']);
 });
 
@@ -966,7 +1011,7 @@ Deno.test('collectImportBindings ignores side-effect-only imports', () => {
         lang: 'ts',
         sourceType: 'module',
     });
-    assertEquals(collectImportBindings(program, '/src', new Set()).size, 0);
+    assertEquals(collectImportBindings(program, '/src').size, 0);
 });
 
 Deno.test('collectImportBindings ignores re-exports', () => {
@@ -975,7 +1020,7 @@ Deno.test('collectImportBindings ignores re-exports', () => {
         lang: 'ts',
         sourceType: 'module',
     });
-    assertEquals(collectImportBindings(program, '/src', new Set()).size, 0);
+    assertEquals(collectImportBindings(program, '/src').size, 0);
 });
 
 Deno.test('collectImportBindings handles mixed default and named imports', () => {
@@ -984,7 +1029,7 @@ Deno.test('collectImportBindings handles mixed default and named imports', () =>
         lang: 'ts',
         sourceType: 'module',
     });
-    const bindings = collectImportBindings(program, '/src', new Set());
+    const bindings = collectImportBindings(program, '/src');
     assertEquals(bindings.get('D')!.importedName, 'default');
     assertEquals(bindings.get('n')!.importedName, 'n');
     assertEquals(bindings.get('D')!.absSpecifier, '/src/a.ts');
@@ -997,7 +1042,7 @@ Deno.test('collectImportBindings handles mixed default and namespace imports', (
         lang: 'ts',
         sourceType: 'module',
     });
-    const bindings = collectImportBindings(program, '/src', new Set());
+    const bindings = collectImportBindings(program, '/src');
     assertEquals(bindings.get('D')!.importedName, 'default');
     assertEquals(bindings.get('ns')!.importedName, '*');
 });
@@ -1008,7 +1053,7 @@ Deno.test('collectImportBindings records aliases with imported and local names',
         lang: 'ts',
         sourceType: 'module',
     });
-    const b = collectImportBindings(program, '/src', new Set()).get('renamed')!;
+    const b = collectImportBindings(program, '/src').get('renamed')!;
     assertEquals(b.localName, 'renamed');
     assertEquals(b.importedName, 'original');
     assertEquals(b.originalSpecifier, './a.ts');
@@ -1020,7 +1065,7 @@ Deno.test('collectImportBindings supports string-literal imported names', () => 
         lang: 'ts',
         sourceType: 'module',
     });
-    const b = collectImportBindings(program, '/src', new Set()).get('loc')!;
+    const b = collectImportBindings(program, '/src').get('loc')!;
     assertEquals(b.importedName, 'orig-name');
 });
 
@@ -1030,7 +1075,7 @@ Deno.test('collectImportBindings keeps the same local name across modules distin
         lang: 'ts',
         sourceType: 'module',
     });
-    const bindings = collectImportBindings(program, '/src', new Set());
+    const bindings = collectImportBindings(program, '/src');
     assertEquals(bindings.get('a')!.absSpecifier, '/src/a.ts');
     assertEquals(bindings.get('b')!.absSpecifier, '/src/b.ts');
     assertEquals(bindings.get('b')!.importedName, 'a');
@@ -1042,7 +1087,7 @@ Deno.test('collectImportBindings later declaration wins for a duplicated local n
         lang: 'ts',
         sourceType: 'module',
     });
-    const bindings = collectImportBindings(program, '/src', new Set());
+    const bindings = collectImportBindings(program, '/src');
     assertEquals(bindings.size, 1);
     assertEquals(bindings.get('x')!.absSpecifier, '/src/b.ts');
 });
@@ -1054,7 +1099,7 @@ Deno.test('collectImportBindings resolves parent-relative specifiers', () => {
         sourceType: 'module',
     });
     assertEquals(
-        collectImportBindings(program, '/src/app', new Set()).get('up')!.absSpecifier,
+        collectImportBindings(program, '/src/app').get('up')!.absSpecifier,
         '/src/shared/up.ts',
     );
 });
@@ -1070,36 +1115,52 @@ import lodash from "lodash";
         lang: 'ts',
         sourceType: 'module',
     });
-    const bindings = collectImportBindings(program, '/src', new Set());
+    const bindings = collectImportBindings(program, '/src');
     assertEquals(bindings.get('join')!.absSpecifier, 'jsr:@std/path');
     assertEquals(bindings.get('readFile')!.absSpecifier, 'node:fs/promises');
     assertEquals(bindings.get('basename')!.absSpecifier, '@std/path');
     assertEquals(bindings.get('lodash')!.absSpecifier, 'lodash');
 });
 
-Deno.test('collectImportBindings drops any local name listed in watchNames', () => {
-    const code = `import { comptime, watch } from "comptime";\nimport { watch as w } from "./x.ts";`;
-    const { program } = parseSync('/src/f.ts', code, {
-        lang: 'ts',
-        sourceType: 'module',
-    });
-    const { watchNames } = collectComptimeBindings(program);
-    const bindings = collectImportBindings(program, '/src', watchNames);
-    assertEquals(bindings.has('w'), true);
-    assertEquals(bindings.has('watch'), false);
-});
+Deno.test(
+    "collectImportBindings keeps an aliased import while dropping the 'comptime' watch",
+    () => {
+        const code = `import { comptime, watch } from "comptime";\nimport { watch as w } from "./x.ts";`;
+        const { program } = parseSync('/src/f.ts', code, {
+            lang: 'ts',
+            sourceType: 'module',
+        });
+        const bindings = collectImportBindings(program, '/src');
+        assertEquals(bindings.has('w'), true);
+        assertEquals(bindings.has('watch'), false);
+    },
+);
 
 Deno.test(
-    'collectImportBindings drops a same-named import from another module (watch shadowing quirk)',
+    'collectImportBindings keeps a same-named import from another module',
     () => {
         const code = `import { comptime, watch } from "comptime";\nimport { watch } from "./chokidar-ish.ts";`;
         const { program } = parseSync('/src/f.ts', code, {
             lang: 'ts',
             sourceType: 'module',
         });
-        const { watchNames } = collectComptimeBindings(program);
-        const bindings = collectImportBindings(program, '/src', watchNames);
-        assertEquals(bindings.has('watch'), false);
+        const bindings = collectImportBindings(program, '/src');
+        assertEquals(bindings.has('watch'), true);
+        assertEquals(bindings.get('watch')!.absSpecifier, '/src/chokidar-ish.ts');
+    },
+);
+
+Deno.test(
+    "collectImportBindings keeps an import named like an aliased 'comptime' watch",
+    () => {
+        const code = `import { comptime, watch as w } from "comptime";\nimport { w } from "./x.ts";`;
+        const { program } = parseSync('/src/f.ts', code, {
+            lang: 'ts',
+            sourceType: 'module',
+        });
+        const bindings = collectImportBindings(program, '/src');
+        assertEquals(bindings.has('w'), true);
+        assertEquals(bindings.get('w')!.absSpecifier, '/src/x.ts');
     },
 );
 
@@ -1729,6 +1790,24 @@ Deno.test('createCore forwards watch files reported by the evaluator', async () 
         { addWatchFile: (id) => void watched.push(id) },
     );
     assertEquals(watched, ['/data/one.json']);
+});
+
+Deno.test("createCore registers files passed to the 'comptime' watch()", async () => {
+    const watched: string[] = [];
+    const core = createCore(new RolldownEvaluator(), {});
+    const result = await core.transform(
+        `
+import { comptime, watch } from "comptime";
+export const x = comptime(() => {
+  watch("/data/config.json");
+  return 7;
+});
+        `.trim(),
+        '/src/f.ts',
+        { addWatchFile: (id) => void watched.push(id) },
+    );
+    assertStringIncludes(result!.code, '7');
+    assertEquals(watched, ['/data/config.json']);
 });
 
 Deno.test('createCore skips watch registration on a cache hit and re-registers after invalidate', async () => {
