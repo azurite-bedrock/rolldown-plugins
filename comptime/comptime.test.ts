@@ -1151,14 +1151,37 @@ Deno.test('collectTopLevelDeclarations ignores non-declaration statements', () =
 
 // collectIdentifierReferences extended
 
-Deno.test('collectIdentifierReferences collects member-expression property names too', () => {
+Deno.test('collectIdentifierReferences skips static member-expression property names', () => {
     const code = `import { comptime } from "comptime";\nexport const x = comptime(() => ns.deep.prop);`;
     const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
     const { comptimeNames } = collectComptimeBindings(program);
     const calls = findComptimeCalls(program, comptimeNames);
     const refs = collectIdentifierReferences(calls[0].fn.body);
     assertEquals(refs.has('ns'), true);
-    assertEquals(refs.has('deep'), true);
+    assertEquals(refs.has('deep'), false);
+    assertEquals(refs.has('prop'), false);
+});
+
+Deno.test('collectIdentifierReferences collects computed member-expression keys', () => {
+    const code = `import { comptime } from "comptime";\nexport const x = comptime(() => ns[key]);`;
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const { comptimeNames } = collectComptimeBindings(program);
+    const calls = findComptimeCalls(program, comptimeNames);
+    const refs = collectIdentifierReferences(calls[0].fn.body);
+    assertEquals(refs.has('ns'), true);
+    assertEquals(refs.has('key'), true);
+});
+
+Deno.test('collectIdentifierReferences skips object-literal keys but keeps values', () => {
+    const code = `import { comptime } from "comptime";\nexport const x = comptime(() => ({ value: inner, [computedKey]: 1, shorthand }));`;
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const { comptimeNames } = collectComptimeBindings(program);
+    const calls = findComptimeCalls(program, comptimeNames);
+    const refs = collectIdentifierReferences(calls[0].fn.body);
+    assertEquals(refs.has('value'), false);
+    assertEquals(refs.has('inner'), true);
+    assertEquals(refs.has('computedKey'), true);
+    assertEquals(refs.has('shorthand'), true);
 });
 
 Deno.test('collectIdentifierReferences returns an empty set for a literal body', () => {
@@ -1247,7 +1270,15 @@ Deno.test('createVirtualModule puts imports before declarations before the body'
     };
     const src = createVirtualModule(
         [binding],
-        [{ names: ['helper'], source: 'const helper = () => a;', start: 0, end: 0 }],
+        [
+            {
+                names: ['helper'],
+                source: 'const helper = () => a;',
+                start: 0,
+                end: 0,
+                refs: new Set(['a']),
+            },
+        ],
         `return helper();`,
     );
     assertEquals(
@@ -2456,7 +2487,7 @@ Deno.test('comptime plugin surfaces failures importing a missing module in the c
 // known limitations (asserting current behaviour)
 
 Deno.test(
-    'BUG: imports referenced only by an inlined top-level declaration are not hoisted',
+    'createCore hoists imports referenced only by an inlined top-level declaration',
     async () => {
         const src = await virtualSourceFor(
             `
@@ -2467,30 +2498,257 @@ export const x = comptime(() => helper());
         `.trim(),
         );
         assertStringIncludes(src, 'const helper = () => HV * 2;');
-        // The import that `helper` depends on is missing from the virtual module.
-        assertEquals(src.includes('/src/h.ts'), false);
+        assertStringIncludes(src, `import { HV } from "/src/h.ts";`);
     },
 );
 
 Deno.test(
-    'BUG: a comptime callback depending on an import via a helper fails at build time',
+    'comptime plugin evaluates a callback depending on an import via a helper',
     async () => {
-        await assertRejects(
-            () =>
-                buildFixture('helper-import-bug', 'entry.ts', () => ({
-                    'h.ts': `export const HV = 10;`,
-                    'entry.ts': `
+        const code = await buildFixture('helper-import', 'entry.ts', () => ({
+            'h.ts': `export const HV = 10;`,
+            'entry.ts': `
 import { comptime } from "comptime";
 import { HV } from "./h.ts";
 const helper = () => HV * 2;
 export const v = comptime(() => helper());
-                    `.trim(),
-                })),
-            Error,
-            'HV is not defined',
-        );
+                `.trim(),
+        }));
+        assertStringIncludes(code, '20');
     },
 );
+
+Deno.test(
+    'createCore hoists declarations reached through a multi-hop chain',
+    async () => {
+        const src = await virtualSourceFor(
+            `
+import { comptime } from "comptime";
+import { DEEP } from "./deep.ts";
+const c = () => DEEP;
+const b = () => c();
+const a = () => b();
+export const x = comptime(() => a());
+        `.trim(),
+        );
+        assertStringIncludes(src, `import { DEEP } from "/src/deep.ts";`);
+        assertStringIncludes(src, 'const c = () => DEEP;');
+        assertStringIncludes(src, 'const b = () => c();');
+        assertStringIncludes(src, 'const a = () => b();');
+        // declarations keep their original source order
+        assertEquals(src.indexOf('const c =') < src.indexOf('const b ='), true);
+        assertEquals(src.indexOf('const b =') < src.indexOf('const a ='), true);
+    },
+);
+
+Deno.test('createCore smoke test: mutually recursive top-level declarations converge', async () => {
+    const src = await virtualSourceFor(
+        `
+import { comptime } from "comptime";
+import { LIMIT } from "./limit.ts";
+function even(n) { return n === 0 ? true : odd(n - 1); }
+function odd(n) { return n === 0 ? false : even(n - LIMIT); }
+export const x = comptime(() => even(4));
+    `.trim(),
+    );
+    assertStringIncludes(src, 'function even(n)');
+    assertStringIncludes(src, 'function odd(n)');
+    assertStringIncludes(src, `import { LIMIT } from "/src/limit.ts";`);
+});
+
+Deno.test(
+    'createCore does not inline a transitively reached declaration containing a comptime call',
+    async () => {
+        const rec = recordingEvaluator();
+        const core = createCore(rec as any, {});
+        await core.transform(
+            `
+import { comptime } from "comptime";
+import { SECRET } from "./secret.ts";
+export const inner = comptime(() => SECRET);
+const helper = () => inner;
+export const x = comptime(() => helper());
+    `.trim(),
+            '/src/f.ts',
+            {},
+        );
+        // The pinned virtual module is intentionally non-evaluable: `helper` is
+        // inlined but `inner` is deliberately left out (its declaration encloses a
+        // comptime call), so a real evaluation would report "inner is not defined".
+        // Nested/dependent comptime calls are a separate known limitation.
+        const src = rec.sources.find((s) => s.includes('helper'))!;
+        assertStringIncludes(src, 'const helper = () => inner;');
+        assertEquals(src.includes('export const inner'), false);
+    },
+);
+
+Deno.test(
+    'createCore does not hoist unrelated imports when following declaration references',
+    async () => {
+        const src = await virtualSourceFor(
+            `
+import { comptime } from "comptime";
+import { rows } from "./data.ts";
+import { unrelated } from "./unrelated.ts";
+const config = unrelated();
+const readConfig = (r) => r.config;
+export const x = comptime(() => rows.map(readConfig));
+    `.trim(),
+        );
+        assertStringIncludes(src, `import { rows } from "/src/data.ts";`);
+        assertStringIncludes(src, 'const readConfig = (r) => r.config;');
+        // `.config` is a property name, not a reference to the top-level `config`.
+        assertEquals(src.includes('const config'), false);
+        assertEquals(src.includes('unrelated'), false);
+    },
+);
+
+Deno.test(
+    'comptime plugin does not evaluate a top-level declaration matched only by a property name',
+    async () => {
+        const code = await buildFixture('property-name-noise', 'entry.ts', () => ({
+            'data.ts': `export const rows = [{ config: 1 }];`,
+            'entry.ts': `
+import { comptime } from "comptime";
+import { rows } from "./data.ts";
+const config = document.querySelector("#cfg");
+const readConfig = (r: { config: number }) => r.config;
+export const v = comptime(() => rows.map(readConfig).join(","));
+                `.trim(),
+        }));
+        assertStringIncludes(code, '"1"');
+    },
+);
+
+Deno.test('createCore does not hoist a declaration shadowed by a helper parameter', async () => {
+    const src = await virtualSourceFor(
+        `
+import { comptime } from "comptime";
+import { unrelated } from "./unrelated.ts";
+const value = unrelated();
+const helper = (value) => value + 1;
+export const x = comptime(() => helper(1));
+    `.trim(),
+    );
+    assertStringIncludes(src, 'const helper = (value) => value + 1;');
+    assertEquals(src.includes('const value'), false);
+    assertEquals(src.includes('unrelated'), false);
+});
+
+Deno.test(
+    'createCore does not hoist a declaration shadowed by an inner local binding',
+    async () => {
+        const src = await virtualSourceFor(
+            `
+import { comptime } from "comptime";
+import { unrelated } from "./unrelated.ts";
+const value = unrelated();
+function helper() { const value = 2; return value; }
+export const x = comptime(() => helper());
+    `.trim(),
+        );
+        assertStringIncludes(src, 'function helper()');
+        assertEquals(src.includes('const value = unrelated'), false);
+        assertEquals(src.includes('unrelated'), false);
+    },
+);
+
+Deno.test(
+    'createCore hoists imports referenced from a destructuring pattern default',
+    async () => {
+        const src = await virtualSourceFor(
+            `
+import { comptime } from "comptime";
+import { DEF, KEY, opts } from "./o.ts";
+const { a = DEF } = opts;
+const { [KEY]: b } = opts;
+export const x = comptime(() => [a, b]);
+    `.trim(),
+        );
+        assertStringIncludes(src, `import { DEF } from "/src/o.ts";`);
+        assertStringIncludes(src, `import { KEY } from "/src/o.ts";`);
+        assertStringIncludes(src, `import { opts } from "/src/o.ts";`);
+        assertStringIncludes(src, 'const { a = DEF } = opts;');
+        assertStringIncludes(src, 'const { [KEY]: b } = opts;');
+    },
+);
+
+Deno.test(
+    'comptime plugin evaluates declarations whose patterns reference imports',
+    async () => {
+        const code = await buildFixture('pattern-refs', 'entry.ts', () => ({
+            'o.ts': `export const DEF = 7;\nexport const KEY = "k";\nexport const opts = { k: 9 };`,
+            'entry.ts': `
+import { comptime } from "comptime";
+import { DEF, KEY, opts } from "./o.ts";
+const { a = DEF } = opts as { a?: number };
+const { [KEY]: b } = opts;
+export const v = comptime(() => a + b);
+                `.trim(),
+        }));
+        assertStringIncludes(code, '16');
+    },
+);
+
+Deno.test('collectIdentifierReferences skips statement labels', () => {
+    const code = `import { comptime } from "comptime";\nexport const x = comptime(() => { outer: for (;;) { continue outer; } });`;
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const { comptimeNames } = collectComptimeBindings(program);
+    const calls = findComptimeCalls(program, comptimeNames);
+    const refs = collectIdentifierReferences(calls[0].fn.body);
+    assertEquals(refs.has('outer'), false);
+});
+
+Deno.test('collectIdentifierReferences skips static accessor-property keys', () => {
+    const code = `class C { accessor value = inner; }`;
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const refs = collectIdentifierReferences(program.body[0]);
+    assertEquals(refs.has('value'), false);
+    assertEquals(refs.has('inner'), true);
+});
+
+Deno.test(
+    'comptime plugin does not hoist a declaration matched only by a statement label',
+    async () => {
+        const code = await buildFixture('label-noise', 'entry.ts', () => ({
+            'entry.ts': `
+import { comptime } from "comptime";
+const outer = document.title;
+function helper() { outer: for (let i = 0; i < 3; i++) { break outer; } return 9; }
+export const v = comptime(() => helper());
+                `.trim(),
+        }));
+        assertStringIncludes(code, '9');
+    },
+);
+
+Deno.test(
+    'comptime plugin does not hoist a declaration shadowed by a var in a nested block',
+    async () => {
+        const code = await buildFixture('nested-var-noise', 'entry.ts', () => ({
+            'entry.ts': `
+import { comptime } from "comptime";
+const total = document.body.childNodes.length;
+function helper() { if (true) { var total = 3; } return total; }
+export const v = comptime(() => helper());
+                `.trim(),
+        }));
+        assertStringIncludes(code, '3');
+    },
+);
+
+Deno.test('createCore hoists imports referenced by a class decorator', async () => {
+    const src = await virtualSourceFor(
+        `
+import { comptime } from "comptime";
+import { deco } from "./deco.ts";
+@deco
+class Widget {}
+export const x = comptime(() => Widget);
+    `.trim(),
+    );
+    assertStringIncludes(src, `import { deco } from "/src/deco.ts";`);
+});
 
 Deno.test('nested comptime calls leave the inner call unresolved in the virtual module', async () => {
     const src = await virtualSourceFor(

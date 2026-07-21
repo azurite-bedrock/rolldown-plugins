@@ -211,31 +211,67 @@ export function collectImportBindings(
     return bindings;
 }
 
-export type TopLevelDecl = { names: string[]; source: string; start: number; end: number };
+export type TopLevelDecl = {
+    names: string[];
+    source: string;
+    start: number;
+    end: number;
+    /** Identifiers referenced by the declaration's own body/initializers. */
+    refs: Set<string>;
+};
+
+/**
+ * Identifiers a declaration depends on, excluding the names it introduces itself
+ * and anything bound locally inside it. Used to walk the dependency graph when
+ * hoisting declarations into a virtual module, so it must not report names that
+ * are not real references to outer bindings.
+ */
+function collectDeclReferences(node: any, names: string[]): Set<string> {
+    const refs = new Set<string>();
+    const add = (from: any) => {
+        if (!from) return;
+        for (const r of collectScopedReferences(from)) refs.add(r);
+    };
+
+    if (node.type === 'VariableDeclaration') {
+        for (const d of node.declarations) {
+            // The id can reference outer bindings too: `const { a = DEF } = o`
+            // and `const { [KEY]: v } = o`. Bound names are stripped below.
+            add(d.id);
+            add(d.init);
+        }
+    } else if (node.type === 'FunctionDeclaration' || node.type === 'ClassDeclaration') {
+        // Whole node: covers params, body, superClass and decorators.
+        add(node);
+    }
+
+    for (const n of names) refs.delete(n);
+    return refs;
+}
 
 export function collectTopLevelDeclarations(program: any, code: string): TopLevelDecl[] {
     const decls: TopLevelDecl[] = [];
+
+    function push(node: any, names: string[]): void {
+        decls.push({
+            names,
+            source: code.slice(node.start, node.end),
+            start: node.start,
+            end: node.end,
+            refs: collectDeclReferences(node, names),
+        });
+    }
 
     function processDecl(node: any): void {
         if (node.type === 'VariableDeclaration') {
             const names = node.declarations.flatMap((d: any) =>
                 extractPatternNames(d.id),
             );
-            decls.push({ names, source: code.slice(node.start, node.end), start: node.start, end: node.end });
+            push(node, names);
         } else if (node.type === 'FunctionDeclaration' && node.id) {
-            decls.push({
-                names: [node.id.name],
-                source: code.slice(node.start, node.end),
-                start: node.start,
-                end: node.end,
-            });
+            push(node, [node.id.name]);
         } else if (node.type === 'ClassDeclaration' && node.id) {
-            decls.push({
-                names: [node.id.name],
-                source: code.slice(node.start, node.end),
-                start: node.start,
-                end: node.end,
-            });
+            push(node, [node.id.name]);
         }
     }
 
@@ -263,22 +299,158 @@ function extractPatternNames(pat: any): string[] {
     return [];
 }
 
+/**
+ * Identifier positions that never resolve to a binding, so they must not count
+ * as references: property names (`x.config`, `{ value: 1 }`) and statement
+ * labels (`outer:`, `break outer`). Shorthand properties keep their separate
+ * `value` node, so the binding is still seen.
+ */
+function isNonReferenceKey(n: any, key: string): boolean {
+    if (key === 'label')
+        return (
+            n.type === 'LabeledStatement' ||
+            n.type === 'BreakStatement' ||
+            n.type === 'ContinueStatement'
+        );
+    if (n.computed) return false;
+    if (key === 'property') return n.type === 'MemberExpression';
+    if (key === 'key')
+        return (
+            n.type === 'Property' ||
+            n.type === 'PropertyDefinition' ||
+            n.type === 'MethodDefinition' ||
+            n.type === 'AccessorProperty'
+        );
+    return false;
+}
+
+function walkChildren(n: any, visit: (child: any) => void): void {
+    for (const key of Object.keys(n)) {
+        if (key === 'type' || key === 'start' || key === 'end') continue;
+        if (isNonReferenceKey(n, key)) continue;
+        const child = n[key];
+        if (Array.isArray(child))
+            child.forEach((c: any) => {
+                if (c && typeof c === 'object') visit(c);
+            });
+        else if (child && typeof child === 'object') visit(child);
+    }
+}
+
 export function collectIdentifierReferences(node: any): Set<string> {
     const refs = new Set<string>();
     function walk(n: any): void {
         if (!n || typeof n !== 'object') return;
         if (n.type === 'Identifier') refs.add(n.name);
-        for (const key of Object.keys(n)) {
-            if (key === 'type' || key === 'start' || key === 'end') continue;
-            const child = n[key];
-            if (Array.isArray(child))
-                child.forEach((c: any) => {
-                    if (c && typeof c === 'object') walk(c);
-                });
-            else if (child && typeof child === 'object') walk(child);
-        }
+        walkChildren(n, walk);
     }
     walk(node);
+    return refs;
+}
+
+/**
+ * `var` and function declarations are function-scoped: they hoist out of nested
+ * blocks, loops, switch cases and try/catch. Collect them from anywhere under
+ * `node` without crossing into a nested function or class, whose own `var`s
+ * belong to that inner scope.
+ */
+function collectHoistedNames(node: any, names: string[]): void {
+    if (!node || typeof node !== 'object') return;
+    const type = node.type;
+    if (
+        type === 'FunctionExpression' ||
+        type === 'ArrowFunctionExpression' ||
+        type === 'ClassDeclaration' ||
+        type === 'ClassExpression' ||
+        type === 'StaticBlock'
+    ) {
+        return;
+    }
+    if (type === 'FunctionDeclaration') {
+        // The name still binds in the enclosing scope (annex B in nested blocks).
+        if (node.id?.name) names.push(node.id.name);
+        return;
+    }
+    if (type === 'VariableDeclaration') {
+        if (node.kind === 'var')
+            for (const d of node.declarations) names.push(...extractPatternNames(d.id));
+        return;
+    }
+    walkChildren(node, (child) => collectHoistedNames(child, names));
+}
+
+function declaredNamesIn(statements: any[]): string[] {
+    const names: string[] = [];
+    for (const st of statements ?? []) {
+        if (!st || typeof st !== 'object') continue;
+        // Lexical declarations bind only at this statement level...
+        if (st.type === 'VariableDeclaration') {
+            for (const d of st.declarations) names.push(...extractPatternNames(d.id));
+        } else if (
+            (st.type === 'FunctionDeclaration' || st.type === 'ClassDeclaration') &&
+            st.id
+        ) {
+            names.push(st.id.name);
+        }
+        // ...while `var`/function declarations hoist out of nested statements.
+        collectHoistedNames(st, names);
+    }
+    return names;
+}
+
+/**
+ * Like collectIdentifierReferences, but skips identifiers that resolve to a
+ * binding introduced inside `node` (parameters, inner declarations, catch
+ * params, loop bindings). Only free identifiers - references to outer scopes -
+ * are reported.
+ */
+export function collectScopedReferences(node: any): Set<string> {
+    const refs = new Set<string>();
+
+    function walk(n: any, bound: Set<string>): void {
+        if (!n || typeof n !== 'object') return;
+        if (n.type === 'Identifier') {
+            if (!bound.has(n.name)) refs.add(n.name);
+            return;
+        }
+
+        let scope = bound;
+        const bind = (names: string[]) => {
+            if (names.length === 0) return;
+            if (scope === bound) scope = new Set(bound);
+            for (const name of names) scope.add(name);
+        };
+
+        if (
+            n.type === 'FunctionDeclaration' ||
+            n.type === 'FunctionExpression' ||
+            n.type === 'ArrowFunctionExpression'
+        ) {
+            if (n.id?.name) bind([n.id.name]);
+            for (const p of n.params ?? []) bind(extractPatternNames(p));
+        } else if (
+            n.type === 'BlockStatement' ||
+            n.type === 'Program' ||
+            n.type === 'StaticBlock'
+        ) {
+            bind(declaredNamesIn(n.body));
+        } else if (n.type === 'CatchClause') {
+            bind(extractPatternNames(n.param));
+        } else if (
+            n.type === 'ForStatement' ||
+            n.type === 'ForInStatement' ||
+            n.type === 'ForOfStatement'
+        ) {
+            const init = n.init ?? n.left;
+            if (init?.type === 'VariableDeclaration') bind(declaredNamesIn([init]));
+        } else if (n.type === 'ClassDeclaration' || n.type === 'ClassExpression') {
+            if (n.id?.name) bind([n.id.name]);
+        }
+
+        walkChildren(n, (child) => walk(child, scope));
+    }
+
+    walk(node, new Set());
     return refs;
 }
 

@@ -16,6 +16,7 @@ import {
     resolveSpecifier,
     type ComptimeOptions,
     type Loc,
+    type TopLevelDecl,
 } from './ast.ts';
 import { createVirtualModule, contentHash, serializeValue } from './virtual.ts';
 
@@ -122,15 +123,37 @@ export function createCore(
                         (_, spec) => `import("${resolveSpecifier(spec, fileDir)}")`,
                     );
 
+                    // Reachability fixpoint: start from what the callback body names,
+                    // then keep pulling in top-level declarations it can reach and the
+                    // identifiers those declarations reference in turn. Without this,
+                    // an inlined declaration could reference an import or another
+                    // declaration the callback never names, and evaluation would fail
+                    // with "X is not defined".
                     const refs = collectIdentifierReferences(fn.body);
+                    // A declaration that encloses a comptime call must never be inlined,
+                    // so it also must not contribute its references.
+                    const inlinable = topLevelDecls.filter(
+                        (d) => !calls.some((c) => c.start >= d.start && c.end <= d.end),
+                    );
+                    const selected = new Set<TopLevelDecl>();
+                    // Terminates because a pass only repeats when it selected a
+                    // declaration: at most one pass per declaration, since `selected`
+                    // is monotone and bounded by `inlinable.length`.
+                    for (let changed = true; changed; ) {
+                        changed = false;
+                        for (const d of inlinable) {
+                            if (selected.has(d)) continue;
+                            if (!d.names.some((n) => refs.has(n))) continue;
+                            selected.add(d);
+                            changed = true;
+                            for (const r of d.refs) refs.add(r);
+                        }
+                    }
                     const usedImports = [...importBindings.values()].filter((b) =>
                         refs.has(b.localName),
                     );
-                    const usedDecls = topLevelDecls.filter(
-                        (d) =>
-                            d.names.some((n) => refs.has(n)) &&
-                            !calls.some((c) => c.start >= d.start && c.end <= d.end),
-                    );
+                    // Original source order is preserved by filtering the collected list.
+                    const usedDecls = inlinable.filter((d) => selected.has(d));
                     const virtual = createVirtualModule(
                         usedImports,
                         usedDecls,
