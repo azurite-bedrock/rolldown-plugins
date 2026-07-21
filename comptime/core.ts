@@ -90,6 +90,19 @@ export function createCore(
             const calls = findComptimeCalls(program, comptimeNames);
             if (calls.length === 0) return null;
 
+            // A nested call cannot be evaluated: the enclosing callback is spliced
+            // into the virtual module verbatim and `comptime` is never hoisted
+            // there, so the inner call would fail with "comptime is not defined".
+            const nested = calls.find((c) => c.nested);
+            if (nested) {
+                const { loc, frame } = getLocAndFrame(code, nested.start, id);
+                throw new ComptimeTransformError(
+                    'comptime() calls cannot be nested: the enclosing comptime() already runs at build time, so remove the inner call',
+                    loc,
+                    frame,
+                );
+            }
+
             const fileDir = normalizeToForwardSlashes(
                 dirname(normalizeToForwardSlashes(id)),
             );

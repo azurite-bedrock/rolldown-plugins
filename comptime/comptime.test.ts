@@ -895,13 +895,69 @@ Deno.test('findComptimeCalls ignores calls with more than one argument', () => {
     assertEquals(findComptimeCalls(program, comptimeNames).length, 0);
 });
 
-Deno.test('findComptimeCalls only records the outer call for nested comptime', () => {
+Deno.test('findComptimeCalls flags an inner call as nested', () => {
     const code = `import { comptime } from "comptime";\nexport const x = comptime(() => comptime(() => 1));`;
     const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
     const { comptimeNames } = collectComptimeBindings(program);
     const calls = findComptimeCalls(program, comptimeNames);
+    assertEquals(calls.length, 2);
+    assertEquals(calls[0].nested, false);
+    assertEquals(calls[1].nested, true);
+    assertEquals(code.slice(calls[1].start, calls[1].end), 'comptime(() => 1)');
+});
+
+Deno.test('findComptimeCalls flags a nested call inside a function in the callback', () => {
+    const code = `
+import { comptime } from "comptime";
+export const x = comptime(() => {
+  function inner() { return comptime(() => 1); }
+  return inner();
+});
+  `.trim();
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const { comptimeNames } = collectComptimeBindings(program);
+    const calls = findComptimeCalls(program, comptimeNames);
+    assertEquals(calls.length, 2);
+    assertEquals(calls[1].nested, true);
+});
+
+Deno.test('findComptimeCalls does not flag a shadowed inner comptime as nested', () => {
+    const code = `
+import { comptime } from "comptime";
+export const x = comptime(() => {
+  const comptime = (f: () => number) => f();
+  return comptime(() => 1);
+});
+  `.trim();
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const { comptimeNames } = collectComptimeBindings(program);
+    const calls = findComptimeCalls(program, comptimeNames);
     assertEquals(calls.length, 1);
-    assertEquals(code.slice(calls[0].start, calls[0].end).includes('comptime(() => 1)'), true);
+    assertEquals(calls[0].nested, false);
+});
+
+Deno.test('findComptimeCalls does not flag a non-call comptime reference as nested', () => {
+    const code = `import { comptime } from "comptime";\nexport const x = comptime(() => typeof comptime);`;
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const { comptimeNames } = collectComptimeBindings(program);
+    const calls = findComptimeCalls(program, comptimeNames);
+    assertEquals(calls.length, 1);
+    assertEquals(calls[0].nested, false);
+});
+
+Deno.test('findComptimeCalls does not flag sibling calls as nested', () => {
+    const code = `
+import { comptime } from "comptime";
+export const a = comptime(() => 1);
+export const b = comptime(() => 2);
+  `.trim();
+    const { program } = parseSync('/f.ts', code, { lang: 'ts', sourceType: 'module' });
+    const { comptimeNames } = collectComptimeBindings(program);
+    const calls = findComptimeCalls(program, comptimeNames);
+    assertEquals(
+        calls.map((c) => c.nested),
+        [false, false],
+    );
 });
 
 Deno.test('findComptimeCalls finds calls nested in functions and object literals', () => {
@@ -2654,7 +2710,9 @@ export const x = comptime(() => helper());
         // The pinned virtual module is intentionally non-evaluable: `helper` is
         // inlined but `inner` is deliberately left out (its declaration encloses a
         // comptime call), so a real evaluation would report "inner is not defined".
-        // Nested/dependent comptime calls are a separate known limitation.
+        // These are sibling calls, not nested ones - one comptime call depending on
+        // the result of another is a separate known limitation, and unlike nesting
+        // (which transform rejects outright) it is not diagnosed here.
         const src = rec.sources.find((s) => s.includes('helper'))!;
         assertStringIncludes(src, 'const helper = () => inner;');
         assertEquals(src.includes('export const inner'), false);
@@ -2829,10 +2887,87 @@ export const x = comptime(() => Widget);
     assertStringIncludes(src, `import { deco } from "/src/deco.ts";`);
 });
 
-Deno.test('nested comptime calls leave the inner call unresolved in the virtual module', async () => {
-    const src = await virtualSourceFor(
-        `import { comptime } from "comptime";\nexport const x = comptime(() => comptime(() => 1));`,
+Deno.test('createCore.transform rejects a directly nested comptime call', async () => {
+    const core = createCore(mockEvaluator as any, {});
+    const err = await assertRejects(
+        () =>
+            core.transform(
+                `import { comptime } from "comptime";\nexport const x = comptime(() => comptime(() => 1));`,
+                '/src/f.ts',
+                {},
+            ),
+        ComptimeTransformError,
+        'comptime() calls cannot be nested',
     );
-    assertStringIncludes(src, 'comptime(() => 1)');
+    assertStringIncludes(err.message, 'remove the inner call');
+    // loc and frame point at the inner call, not the outer one.
+    assertEquals(err.loc, { file: '/src/f.ts', line: 2, column: 33 });
+    assertEquals(
+        err.frame,
+        `export const x = comptime(() => comptime(() => 1));\n${' '.repeat(32)}^`,
+    );
+});
+
+Deno.test(
+    'createCore.transform rejects a nested comptime call inside a function in the callback',
+    async () => {
+        const core = createCore(mockEvaluator as any, {});
+        const err = await assertRejects(
+            () =>
+                core.transform(
+                    `
+import { comptime } from "comptime";
+export const x = comptime(() => {
+  function inner() { return comptime(() => 1); }
+  return inner();
+});
+        `.trim(),
+                    '/src/f.ts',
+                    {},
+                ),
+            ComptimeTransformError,
+            'comptime() calls cannot be nested',
+        );
+        assertEquals(err.loc.line, 3);
+        assertEquals(err.loc.column, 29);
+        assertStringIncludes(err.frame, 'function inner() { return comptime(() => 1); }');
+    },
+);
+
+Deno.test('createCore.transform accepts a shadowed inner comptime call', async () => {
+    const src = await virtualSourceFor(
+        `
+import { comptime } from "comptime";
+export const x = comptime(() => {
+  const comptime = (f: () => number) => f();
+  return comptime(() => 1);
+});
+    `.trim(),
+    );
+    assertStringIncludes(src, 'const comptime = (f: () => number) => f();');
     assertEquals(src.includes('import { comptime }'), false);
+});
+
+Deno.test('createCore.transform accepts a non-call comptime reference in the callback', async () => {
+    const src = await virtualSourceFor(
+        `import { comptime } from "comptime";\nexport const x = comptime(() => typeof comptime);`,
+    );
+    assertStringIncludes(src, 'return (typeof comptime);');
+});
+
+Deno.test('createCore.transform still evaluates two sibling comptime calls', async () => {
+    const rec = recordingEvaluator();
+    const core = createCore(rec as any, {});
+    const result = await core.transform(
+        `
+import { comptime } from "comptime";
+export const a = comptime(() => 1);
+export const b = comptime(() => 2);
+    `.trim(),
+        '/src/f.ts',
+        {},
+    );
+    assertEquals(rec.sources.length, 2);
+    assertStringIncludes(result!.code, 'export const a = 1;');
+    assertStringIncludes(result!.code, 'export const b = 1;');
 });

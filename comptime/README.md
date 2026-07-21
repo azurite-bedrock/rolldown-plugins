@@ -137,6 +137,9 @@ ComptimeTransformError: comptime evaluation threw: Cannot read file
 ## Constraints
 
 - The arrow function passed to `comptime()` must have no parameters.
+- `comptime()` calls cannot be nested. The enclosing call already runs at build
+  time, so a nested one is redundant and is rejected with a
+  `ComptimeTransformError` pointing at the inner call.
 - The return value must be serializable by `devalue` (or a custom serializer).
 - Dynamic imports inside the body using relative paths are rewritten to absolute paths automatically.
 - Files are only scanned if they contain the substring `"comptime"` and have a supported extension (`.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`, `.tsx`, `.mts`, `.cts`).

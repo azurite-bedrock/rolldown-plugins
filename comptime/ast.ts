@@ -69,7 +69,14 @@ export function collectComptimeBindings(program: any): ComptimeBindings {
     return { comptimeNames, watchNames };
 }
 
-export type ComptimeCall = { start: number; end: number; fn: any; index: number };
+export type ComptimeCall = {
+    start: number;
+    end: number;
+    fn: any;
+    index: number;
+    /** True when this call sits inside another comptime call's callback. */
+    nested: boolean;
+};
 
 export function findComptimeCalls(
     program: any,
@@ -78,9 +85,10 @@ export function findComptimeCalls(
     const calls: ComptimeCall[] = [];
     let index = 0;
 
-    function walk(node: any, shadowed: Set<string>): void {
+    function walk(node: any, shadowed: Set<string>, inComptime: boolean): void {
         if (!node || typeof node !== 'object') return;
 
+        let childInComptime = inComptime;
         if (node.type === 'CallExpression') {
             const callee = node.callee;
             if (
@@ -96,8 +104,12 @@ export function findComptimeCalls(
                     end: node.end,
                     fn: node.arguments[0],
                     index: index++,
+                    nested: inComptime,
                 });
-                return;
+                // Keep descending: the callback is spliced into a virtual module
+                // verbatim, and a comptime call inside it would land there with no
+                // binding to resolve it. Reporting those is the caller's job.
+                childInComptime = true;
             }
         }
 
@@ -135,18 +147,18 @@ export function findComptimeCalls(
                             }
                         }
                         // Still walk the initializers with the pre-shadow set so the init itself is not shadowed
-                        walk(item, childShadowed);
+                        walk(item, childShadowed, childInComptime);
                     } else {
-                        walk(item, siblingShadowed);
+                        walk(item, siblingShadowed, childInComptime);
                     }
                 }
             } else if (child && typeof child === 'object' && 'type' in child) {
-                walk(child, childShadowed);
+                walk(child, childShadowed, childInComptime);
             }
         }
     }
 
-    walk(program, new Set());
+    walk(program, new Set(), false);
     return calls;
 }
 
