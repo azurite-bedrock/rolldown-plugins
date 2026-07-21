@@ -17,11 +17,14 @@ import {
     collectDenoEnvReads,
     collectIdentifierReferences,
     collectImportBindings,
+    collectScopedReferences,
     collectTopLevelDeclarations,
     findComptimeCalls,
     type ImportBinding,
+    type TopLevelDecl,
 } from './ast.ts';
-import { ComptimeTransformError } from './errors.ts';
+import { allUnmodifiedDuring, depsUnchanged, stampAll } from './deps.ts';
+import { ComptimeTransformError, getLocAndFrame } from './errors.ts';
 import { shouldScan } from './options.ts';
 import {
     hasUriScheme,
@@ -31,7 +34,13 @@ import {
 } from './paths.ts';
 import { contentHash, createVirtualModule, serializeValue } from './virtual.ts';
 import { createTransformer } from './transform.ts';
-import { RolldownEvaluator, type EvaluateResult } from './evaluator.ts';
+import {
+    findDenoConfig,
+    localFilesPlugin,
+    RolldownEvaluator,
+    virtualIdToSourcePath,
+    type EvaluateResult,
+} from './evaluator.ts';
 import { comptime as comptimePlugin } from './plugin.ts';
 
 // runtime
@@ -3335,4 +3344,838 @@ export const b = comptime(() => 2);
     assertEquals(rec.sources.length, 2);
     assertStringIncludes(result!.code, 'export const a = 1;');
     assertStringIncludes(result!.code, 'export const b = 1;');
+});
+
+// getLocAndFrame
+
+Deno.test('getLocAndFrame reports line 1 column 1 for position 0', () => {
+    const { loc, frame } = getLocAndFrame('abc\ndef', 0, '/src/f.ts');
+    assertEquals(loc, { file: '/src/f.ts', line: 1, column: 1 });
+    assertEquals(frame, 'abc\n^');
+});
+
+Deno.test('getLocAndFrame counts columns from one within the first line', () => {
+    const { loc, frame } = getLocAndFrame('abc\ndef', 2, '/f.ts');
+    assertEquals(loc.line, 1);
+    assertEquals(loc.column, 3);
+    assertEquals(frame, 'abc\n  ^');
+});
+
+Deno.test('getLocAndFrame resets the column on every following line', () => {
+    const code = 'const a = 1;\nconst b = 2;\nconst c = 3;';
+    const pos = code.indexOf('b');
+    const { loc, frame } = getLocAndFrame(code, pos, '/f.ts');
+    assertEquals(loc.line, 2);
+    assertEquals(loc.column, 7);
+    assertEquals(frame, 'const b = 2;\n      ^');
+});
+
+Deno.test('getLocAndFrame points one past the last character at the end of input', () => {
+    const { loc, frame } = getLocAndFrame('abc\ndef', 7, '/f.ts');
+    assertEquals(loc.line, 2);
+    assertEquals(loc.column, 4);
+    assertEquals(frame, 'def\n   ^');
+});
+
+Deno.test('getLocAndFrame clamps a position past the end of the input', () => {
+    // `code.slice(0, pos)` is what clamps: a stale offset cannot throw or index
+    // a line that does not exist. Asserted against concrete values rather than
+    // against the in-range call, which an arithmetic error would shift too.
+    const { loc, frame } = getLocAndFrame('abc\ndef', 999, '/f.ts');
+    assertEquals(loc, { file: '/f.ts', line: 2, column: 4 });
+    assertEquals(frame, 'def\n   ^');
+});
+
+Deno.test('getLocAndFrame handles a position on an empty line', () => {
+    const { loc, frame } = getLocAndFrame('a\n\nb', 2, '/f.ts');
+    assertEquals(loc.line, 2);
+    assertEquals(loc.column, 1);
+    assertEquals(frame, '\n^');
+});
+
+Deno.test('getLocAndFrame handles empty code and a trailing newline', () => {
+    assertEquals(getLocAndFrame('', 0, '/f.ts').loc, {
+        file: '/f.ts',
+        line: 1,
+        column: 1,
+    });
+    // Past the final newline there is no line at all, and the `?? ''` fallback
+    // supplies an empty source line rather than throwing.
+    const trailing = getLocAndFrame('abc\n', 4, '/f.ts');
+    assertEquals(trailing.loc.line, 2);
+    assertEquals(trailing.frame, '\n^');
+});
+
+// Lines are split on '\n' alone, so a CRLF file keeps its carriage return at the
+// end of the frame's source line. Current behaviour, pinned rather than fixed.
+Deno.test('getLocAndFrame keeps the carriage return of a CRLF line in the frame', () => {
+    const code = 'const x = 1;\r\nconst y = 2;';
+    const { loc, frame } = getLocAndFrame(code, 6, '/f.ts');
+    assertEquals(loc, { file: '/f.ts', line: 1, column: 7 });
+    assertEquals(frame, 'const x = 1;\r\n      ^');
+    // The next line is unaffected: the CR belongs to the line before it.
+    const next = getLocAndFrame(code, code.indexOf('const y'), '/f.ts');
+    assertEquals(next.loc.line, 2);
+    assertEquals(next.frame, 'const y = 2;\n^');
+});
+
+// The caret is padded with one space per preceding character, so a tab-indented
+// line renders with the caret to the left of where the tab stops put the token.
+// Current behaviour, pinned rather than fixed.
+Deno.test('getLocAndFrame pads the caret with spaces on a tab-indented line', () => {
+    const { loc, frame } = getLocAndFrame('\t\tconst x = 1;', 2, '/f.ts');
+    assertEquals(loc.column, 3);
+    assertEquals(frame, '\t\tconst x = 1;\n  ^');
+});
+
+Deno.test('getLocAndFrame carries the id through as the loc file', () => {
+    assertEquals(getLocAndFrame('x', 0, '\0virtual:thing').loc.file, '\0virtual:thing');
+});
+
+// deps: temp-directory helper
+
+// Every filesystem test below gets its own directory from Deno.makeTempDir, so
+// concurrent runs of the suite cannot observe each other's writes.
+async function withTempDir(body: (dir: string) => Promise<void>): Promise<void> {
+    const dir = (await Deno.makeTempDir({ prefix: 'comptime-unit-' })).replace(
+        /\\/g,
+        '/',
+    );
+    try {
+        await body(dir);
+    } finally {
+        await Deno.remove(dir, { recursive: true }).catch(() => {});
+    }
+}
+
+const UNREADABLE = '\0unreadable';
+
+// deps: stampAll
+
+Deno.test('stampAll returns an empty map for no paths', async () => {
+    assertEquals([...(await stampAll([]))], []);
+});
+
+Deno.test('stampAll reads a repeated path only once', async () => {
+    await withTempDir(async (dir) => {
+        const file = join(dir, 'a.txt');
+        await Deno.writeTextFile(file, 'x');
+        const opened: string[] = [];
+        const realOpen = Deno.open;
+        (Deno as any).open = (path: string | URL, opts?: Deno.OpenOptions) => {
+            opened.push(String(path));
+            return realOpen(path, opts);
+        };
+        let stamps: Map<string, string>;
+        try {
+            stamps = await stampAll([file, file, file]);
+        } finally {
+            (Deno as any).open = realOpen;
+        }
+        // Duplicates are collapsed before any I/O: a dependency named twice is
+        // one read, not three.
+        assertEquals(opened.filter((p) => p === file).length, 1);
+        assertEquals(stamps.size, 1);
+        assertMatch(stamps.get(file)!, /^[0-9a-f]{64}$/);
+    });
+});
+
+Deno.test('stampAll gives equal content equal stamps and different content different ones', async () => {
+    await withTempDir(async (dir) => {
+        const a = join(dir, 'a.txt');
+        const b = join(dir, 'b.txt');
+        const c = join(dir, 'c.txt');
+        await Deno.writeTextFile(a, 'same');
+        await Deno.writeTextFile(b, 'same');
+        await Deno.writeTextFile(c, 'other');
+        const stamps = await stampAll([a, b, c]);
+        assertEquals(stamps.get(a), stamps.get(b));
+        assertNotEquals(stamps.get(a), stamps.get(c));
+    });
+});
+
+Deno.test('stampAll is stable across calls while the file is untouched', async () => {
+    await withTempDir(async (dir) => {
+        const file = join(dir, 'a.txt');
+        await Deno.writeTextFile(file, 'content');
+        const first = await stampAll([file]);
+        const second = await stampAll([file]);
+        assertEquals(first.get(file), second.get(file));
+        await Deno.writeTextFile(file, 'content!');
+        const third = await stampAll([file]);
+        assertNotEquals(first.get(file), third.get(file));
+    });
+});
+
+Deno.test('stampAll reports the unreadable sentinel for missing paths and directories', async () => {
+    await withTempDir(async (dir) => {
+        const missing = join(dir, 'gone.txt');
+        const stamps = await stampAll([missing, dir]);
+        // A directory opens on Unix and only fails on read; both land on the
+        // same sentinel, which cannot collide with a hex digest.
+        assertEquals(stamps.get(missing), UNREADABLE);
+        assertEquals(stamps.get(dir), UNREADABLE);
+    });
+});
+
+Deno.test('stampAll digests a file larger than the read buffer correctly', async () => {
+    await withTempDir(async (dir) => {
+        // Past the 1MB reuse buffer, so the incremental read loop runs several
+        // times; a single-chunk digest would not match the whole-file one.
+        const bytes = new Uint8Array(1_500_000);
+        for (let i = 0; i < bytes.length; i++) bytes[i] = i % 251;
+        const file = join(dir, 'big.bin');
+        await Deno.writeFile(file, bytes);
+        const digest = await crypto.subtle.digest('SHA-256', bytes);
+        const expected = Array.from(new Uint8Array(digest), (b) =>
+            b.toString(16).padStart(2, '0'),
+        ).join('');
+        assertEquals((await stampAll([file])).get(file), expected);
+    });
+});
+
+// deps: depsUnchanged
+
+Deno.test('depsUnchanged is true for an empty dependency set', async () => {
+    assertEquals(await depsUnchanged(new Map()), true);
+});
+
+Deno.test('depsUnchanged is true while every dependency is untouched', async () => {
+    await withTempDir(async (dir) => {
+        const a = join(dir, 'a.txt');
+        const b = join(dir, 'b.txt');
+        await Deno.writeTextFile(a, 'one');
+        await Deno.writeTextFile(b, 'two');
+        assertEquals(await depsUnchanged(await stampAll([a, b])), true);
+    });
+});
+
+Deno.test('depsUnchanged is false when one of several dependencies changes', async () => {
+    await withTempDir(async (dir) => {
+        const a = join(dir, 'a.txt');
+        const b = join(dir, 'b.txt');
+        await Deno.writeTextFile(a, 'one');
+        await Deno.writeTextFile(b, 'two');
+        const stamps = await stampAll([a, b]);
+        await Deno.writeTextFile(b, 'two!');
+        assertEquals(await depsUnchanged(stamps), false);
+    });
+});
+
+Deno.test('depsUnchanged is true when the content is rewritten identically', async () => {
+    await withTempDir(async (dir) => {
+        const a = join(dir, 'a.txt');
+        await Deno.writeTextFile(a, 'one');
+        const stamps = await stampAll([a]);
+        // Content, not timestamps, is what the stamps describe.
+        await Deno.writeTextFile(a, 'one');
+        assertEquals(await depsUnchanged(stamps), true);
+    });
+});
+
+Deno.test('depsUnchanged is false once a stamped dependency is deleted', async () => {
+    await withTempDir(async (dir) => {
+        const a = join(dir, 'a.txt');
+        await Deno.writeTextFile(a, 'one');
+        const stamps = await stampAll([a]);
+        await Deno.remove(a);
+        assertEquals(await depsUnchanged(stamps), false);
+    });
+});
+
+Deno.test('depsUnchanged stays true while an unreadable dependency stays unreadable', async () => {
+    await withTempDir(async (dir) => {
+        const missing = join(dir, 'gone.txt');
+        const stamps = await stampAll([missing]);
+        assertEquals(stamps.get(missing), UNREADABLE);
+        assertEquals(await depsUnchanged(stamps), true);
+    });
+});
+
+Deno.test('depsUnchanged is false as soon as an unreadable dependency becomes readable', async () => {
+    await withTempDir(async (dir) => {
+        const missing = join(dir, 'gone.txt');
+        const stamps = await stampAll([missing]);
+        await Deno.writeTextFile(missing, 'now here');
+        assertEquals(await depsUnchanged(stamps), false);
+    });
+});
+
+Deno.test('depsUnchanged rejects a stamp map holding a foreign value', async () => {
+    await withTempDir(async (dir) => {
+        const a = join(dir, 'a.txt');
+        await Deno.writeTextFile(a, 'one');
+        // The comparison is against the recorded stamp, not against a re-stamp
+        // of the same file taken twice.
+        assertEquals(await depsUnchanged(new Map([[a, 'deadbeef']])), false);
+    });
+});
+
+// deps: allUnmodifiedDuring
+//
+// These pin timestamp arithmetic without sleeping: a cutoff is chosen relative
+// to `Date.now()` so the answer is fixed by construction, never by how long the
+// test happened to take. `startedAt` in the future means the 2s slack window
+// still ends after every timestamp a just-created file can carry.
+
+Deno.test('allUnmodifiedDuring is true for no paths', async () => {
+    assertEquals(await allUnmodifiedDuring([], Date.now()), true);
+});
+
+Deno.test('allUnmodifiedDuring is false for a file written just before the cutoff', async () => {
+    await withTempDir(async (dir) => {
+        const a = join(dir, 'a.txt');
+        await Deno.writeTextFile(a, 'one');
+        // Written milliseconds ago, so it lands inside the slack window and
+        // counts as possibly concurrent with the evaluation.
+        assertEquals(await allUnmodifiedDuring([a], Date.now()), false);
+    });
+});
+
+Deno.test('allUnmodifiedDuring is true for a file settled before the cutoff', async () => {
+    await withTempDir(async (dir) => {
+        const a = join(dir, 'a.txt');
+        await Deno.writeTextFile(a, 'one');
+        // Cutoff is startedAt - 2s, so a start 10s in the future puts the write
+        // safely behind it.
+        assertEquals(await allUnmodifiedDuring([a], Date.now() + 10_000), true);
+    });
+});
+
+Deno.test('allUnmodifiedDuring ignores an mtime moved into the past', async () => {
+    await withTempDir(async (dir) => {
+        const a = join(dir, 'a.txt');
+        await Deno.writeTextFile(a, 'one');
+        const past = new Date(Date.now() - 60_000);
+        Deno.utimeSync(a, past, past);
+        // ctime is not settable and still points at the write, which is what
+        // keeps a preserved or backdated mtime from claiming the file settled.
+        assertEquals(await allUnmodifiedDuring([a], Date.now()), false);
+    });
+});
+
+Deno.test('allUnmodifiedDuring falls back to the parent directory for a missing file', async () => {
+    await withTempDir(async (dir) => {
+        const missing = join(dir, 'gone.txt');
+        // The directory was created moments ago, so a removal cannot be ruled
+        // out and the answer is the conservative one.
+        assertEquals(await allUnmodifiedDuring([missing], Date.now()), false);
+        // With the directory itself settled, a file that never existed is fine.
+        assertEquals(await allUnmodifiedDuring([missing], Date.now() + 10_000), true);
+    });
+});
+
+Deno.test('allUnmodifiedDuring is true when the parent directory is gone too', async () => {
+    // Nothing left to compare against: a whole tree removed mid-evaluation is
+    // not seen. Pinned so the documented blind spot cannot drift.
+    assertEquals(await allUnmodifiedDuring(['/no/such/dir/x.txt'], Date.now()), true);
+});
+
+Deno.test('allUnmodifiedDuring is false when any single path is unsettled', async () => {
+    await withTempDir(async (dir) => {
+        const a = join(dir, 'a.txt');
+        const b = join(dir, 'b.txt');
+        await Deno.writeTextFile(a, 'one');
+        await Deno.writeTextFile(b, 'two');
+        const past = new Date(Date.now() - 60_000);
+        Deno.utimeSync(a, past, past);
+        assertEquals(await allUnmodifiedDuring([a, b], Date.now() + 10_000), true);
+        assertEquals(await allUnmodifiedDuring([a, b], Date.now()), false);
+        // A mixed batch, so every path has to be consulted rather than just the
+        // first: the absent tree answers true and the recent file answers false.
+        assertEquals(
+            await allUnmodifiedDuring(['/no/such/dir/x.txt', b], Date.now()),
+            false,
+        );
+        assertEquals(
+            await allUnmodifiedDuring([b, '/no/such/dir/x.txt'], Date.now()),
+            false,
+        );
+    });
+});
+
+// evaluator: findDenoConfig
+
+Deno.test('findDenoConfig finds a config in the starting directory', async () => {
+    await withTempDir(async (dir) => {
+        const config = join(dir, 'deno.json');
+        await Deno.writeTextFile(config, '{}');
+        assertEquals(findDenoConfig(dir), config);
+    });
+});
+
+Deno.test('findDenoConfig walks up from a nested directory', async () => {
+    await withTempDir(async (dir) => {
+        const config = join(dir, 'deno.json');
+        await Deno.writeTextFile(config, '{}');
+        const nested = join(dir, 'a', 'b', 'c');
+        await ensureDir(nested);
+        assertEquals(findDenoConfig(nested), config);
+    });
+});
+
+Deno.test('findDenoConfig prefers deno.json over deno.jsonc in the same directory', async () => {
+    await withTempDir(async (dir) => {
+        await Deno.writeTextFile(join(dir, 'deno.json'), '{}');
+        await Deno.writeTextFile(join(dir, 'deno.jsonc'), '{}');
+        const nested = join(dir, 'a');
+        await ensureDir(nested);
+        assertEquals(findDenoConfig(nested), join(dir, 'deno.json'));
+    });
+});
+
+Deno.test('findDenoConfig accepts deno.jsonc when there is no deno.json', async () => {
+    await withTempDir(async (dir) => {
+        const config = join(dir, 'deno.jsonc');
+        await Deno.writeTextFile(config, '// comment\n{}');
+        assertEquals(findDenoConfig(dir), config);
+    });
+});
+
+Deno.test('findDenoConfig stops at the nearest directory holding a config', async () => {
+    await withTempDir(async (dir) => {
+        // A workspace layout: the member config is what a source file inside the
+        // member resolves to, not the root one above it.
+        await Deno.writeTextFile(join(dir, 'deno.json'), '{}');
+        const member = join(dir, 'packages', 'member');
+        await ensureDir(join(member, 'src'));
+        const memberConfig = join(member, 'deno.json');
+        await Deno.writeTextFile(memberConfig, '{}');
+        assertEquals(findDenoConfig(join(member, 'src')), memberConfig);
+        assertEquals(findDenoConfig(dir), join(dir, 'deno.json'));
+    });
+});
+
+Deno.test('findDenoConfig skips a deno.json that is not a file', async () => {
+    await withTempDir(async (dir) => {
+        await ensureDir(join(dir, 'deno.json'));
+        const config = join(dir, 'deno.jsonc');
+        await Deno.writeTextFile(config, '{}');
+        assertEquals(findDenoConfig(dir), config);
+    });
+});
+
+Deno.test('findDenoConfig finds nothing inside a tree that holds no config', async () => {
+    await withTempDir(async (dir) => {
+        const nested = join(dir, 'a', 'b');
+        await ensureDir(nested);
+        // What sits above the system temp directory is the host's business - it
+        // is undefined on a normal machine and a real config when TMPDIR points
+        // inside a project - so the claim is stated relative to it: an empty
+        // tree contributes nothing, and the walk terminates at the root either
+        // way rather than inventing a path that was never stat'ed.
+        const above = findDenoConfig(dir);
+        const found = findDenoConfig(nested);
+        assertEquals(found, above);
+        assertEquals(found?.startsWith(dir) ?? false, false);
+    });
+});
+
+// The lookup is memoised per starting directory for the lifetime of the process,
+// so a config created after the first lookup is not picked up. Current
+// behaviour, pinned rather than fixed.
+Deno.test('findDenoConfig caches the answer for a starting directory', async () => {
+    await withTempDir(async (dir) => {
+        // Whatever the first lookup answered - undefined, or a config above the
+        // system temp directory on a host whose TMPDIR sits inside a project -
+        // is what every later lookup for this directory answers.
+        const before = findDenoConfig(dir);
+        const config = join(dir, 'deno.json');
+        await Deno.writeTextFile(config, '{}');
+        assertEquals(findDenoConfig(dir), before);
+        assertNotEquals(findDenoConfig(dir), config);
+        // A different starting directory has no entry yet and does see it.
+        const nested = join(dir, 'a');
+        await ensureDir(nested);
+        assertEquals(findDenoConfig(nested), config);
+    });
+});
+
+// evaluator: the discovered config reaches the inner build
+
+Deno.test('RolldownEvaluator resolves a bare specifier through the discovered deno.json', async () => {
+    await withTempDir(async (dir) => {
+        await Deno.writeTextFile(join(dir, 'lib.ts'), 'export const N = 7;');
+        await Deno.writeTextFile(
+            join(dir, 'deno.json'),
+            JSON.stringify({ imports: { 'comptime-test-alias': './lib.ts' } }),
+        );
+        const nested = join(dir, 'src', 'deep');
+        await ensureDir(nested);
+        const result = await new RolldownEvaluator().evaluate(
+            `\0comptime:${join(nested, 'entry.ts')}?comptime=0`,
+            `import { N } from "comptime-test-alias";\nexport default N;\nexport const __comptime_watch = [];`,
+        );
+        assertEquals(result.value, 7);
+    });
+});
+
+Deno.test('RolldownEvaluator resolves a bare specifier through a discovered deno.jsonc', async () => {
+    await withTempDir(async (dir) => {
+        await Deno.writeTextFile(join(dir, 'lib.ts'), 'export const N = 8;');
+        await Deno.writeTextFile(
+            join(dir, 'deno.jsonc'),
+            '// a jsonc config, comments and all\n' +
+                JSON.stringify({ imports: { 'comptime-test-alias-c': './lib.ts' } }),
+        );
+        const result = await new RolldownEvaluator().evaluate(
+            `\0comptime:${join(dir, 'entry.ts')}?comptime=0`,
+            `import { N } from "comptime-test-alias-c";\nexport default N;\nexport const __comptime_watch = [];`,
+        );
+        assertEquals(result.value, 8);
+    });
+});
+
+Deno.test('RolldownEvaluator uses the config nearest the evaluated source file', async () => {
+    await withTempDir(async (dir) => {
+        await Deno.writeTextFile(join(dir, 'root.ts'), 'export const N = "root";');
+        await Deno.writeTextFile(
+            join(dir, 'deno.json'),
+            JSON.stringify({ imports: { 'comptime-test-near': './root.ts' } }),
+        );
+        const member = join(dir, 'member');
+        await ensureDir(member);
+        await Deno.writeTextFile(join(member, 'own.ts'), 'export const N = "member";');
+        await Deno.writeTextFile(
+            join(member, 'deno.json'),
+            JSON.stringify({ imports: { 'comptime-test-near': './own.ts' } }),
+        );
+        const result = await new RolldownEvaluator().evaluate(
+            `\0comptime:${join(member, 'entry.ts')}?comptime=0`,
+            `import { N } from "comptime-test-near";\nexport default N;\nexport const __comptime_watch = [];`,
+        );
+        assertEquals(result.value, 'member');
+    });
+});
+
+Deno.test('RolldownEvaluator fails when no discovered config maps the specifier', async () => {
+    await withTempDir(async (dir) => {
+        await assertRejects(
+            () =>
+                new RolldownEvaluator().evaluate(
+                    `\0comptime:${join(dir, 'entry.ts')}?comptime=0`,
+                    `import { N } from "comptime-test-unmapped";\nexport default N;\nexport const __comptime_watch = [];`,
+                ),
+            Error,
+            'comptime inner build failed',
+        );
+    });
+});
+
+// evaluator: localFilesPlugin
+//
+// The plugin only claims Windows drive-letter ids, so on a POSIX host it is
+// inert and absolute paths reach the deno plugin instead. Pinned as written.
+
+Deno.test('localFilesPlugin resolves only drive-letter ids', () => {
+    const plugin = localFilesPlugin() as any;
+    assertEquals(plugin.name, 'comptime-local-files');
+    assertEquals(plugin.resolveId.call(null, 'C:/src/a.ts'), 'C:/src/a.ts');
+    assertEquals(plugin.resolveId.call(null, 'c:\\src\\a.ts'), 'c:\\src\\a.ts');
+    for (const id of ['/abs/a.ts', './rel.ts', 'npm:lodash', 'jsr:@std/path', 'node:fs'])
+        assertEquals(plugin.resolveId.call(null, id), null);
+});
+
+Deno.test('localFilesPlugin loads nothing for ids it did not resolve', async () => {
+    const plugin = localFilesPlugin() as any;
+    for (const id of ['/abs/a.ts', './rel.ts', 'npm:lodash', '\0virtual:x'])
+        assertEquals(await plugin.load.call(null, id), null);
+});
+
+Deno.test('localFilesPlugin reads a drive-letter id from disk', async () => {
+    const plugin = localFilesPlugin() as any;
+    // Reaching the read - and failing there rather than returning null - is what
+    // shows a drive path is routed to the local loader instead of the deno one.
+    await assertRejects(
+        () => plugin.load.call(null, 'Q:/no/such/file.ts'),
+        Deno.errors.NotFound,
+    );
+});
+
+// evaluator: virtualIdToSourcePath
+
+Deno.test('virtualIdToSourcePath strips the prefix and the comptime index', () => {
+    assertEquals(virtualIdToSourcePath('\0comptime:/src/a.ts?comptime=0'), '/src/a.ts');
+    assertEquals(virtualIdToSourcePath('\0comptime:/src/a.ts?comptime=17'), '/src/a.ts');
+});
+
+Deno.test('virtualIdToSourcePath handles a windows drive path', () => {
+    assertEquals(
+        virtualIdToSourcePath('\0comptime:C:/src/a.ts?comptime=3'),
+        'C:/src/a.ts',
+    );
+});
+
+Deno.test('virtualIdToSourcePath leaves an id without an index suffix alone', () => {
+    assertEquals(virtualIdToSourcePath('\0comptime:/src/a.ts'), '/src/a.ts');
+});
+
+Deno.test('virtualIdToSourcePath only strips a well-formed trailing suffix', () => {
+    // Anchored at the end and digits only, so a query that merely looks similar
+    // stays part of the path.
+    assertEquals(
+        virtualIdToSourcePath('\0comptime:/src/a.ts?comptime=0x'),
+        '/src/a.ts?comptime=0x',
+    );
+    assertEquals(
+        virtualIdToSourcePath('\0comptime:/src/a.ts?comptime=1&x=2'),
+        '/src/a.ts?comptime=1&x=2',
+    );
+});
+
+// evaluator: module evaluation details
+
+Deno.test('RolldownEvaluator re-evaluates a virtual id whose source changed', async () => {
+    const evaluator = new RolldownEvaluator();
+    const id = '\0comptime:/fake/reuse.ts?comptime=0';
+    const first = await evaluator.evaluate(
+        id,
+        `export default 1; export const __comptime_watch = [];`,
+    );
+    const second = await evaluator.evaluate(
+        id,
+        `export default 2; export const __comptime_watch = [];`,
+    );
+    assertEquals(first.value, 1);
+    assertEquals(second.value, 2);
+});
+
+Deno.test('RolldownEvaluator runs the module again for an identical id and source', async () => {
+    // The trailing `__comptime_eval_<n>` comment is the only thing that makes
+    // the two data URLs differ, and a module URL is evaluated once per process.
+    const evaluator = new RolldownEvaluator();
+    const id = '\0comptime:/fake/nonce.ts?comptime=0';
+    const source = `
+    const g = globalThis as any;
+    g.__comptimeNonceProbe = (g.__comptimeNonceProbe ?? 0) + 1;
+    export default g.__comptimeNonceProbe;
+    export const __comptime_watch = [];
+  `;
+    try {
+        assertEquals((await evaluator.evaluate(id, source)).value, 1);
+        assertEquals((await evaluator.evaluate(id, source)).value, 2);
+    } finally {
+        delete (globalThis as any).__comptimeNonceProbe;
+    }
+});
+
+Deno.test('RolldownEvaluator reports no watch files when the export is not an array', async () => {
+    const evaluator = new RolldownEvaluator();
+    const result = await evaluator.evaluate(
+        '\0comptime:/fake/w.ts?comptime=0',
+        `export default 1; export const __comptime_watch = "not-an-array";`,
+    );
+    assertEquals(result.watchFiles, []);
+});
+
+Deno.test('RolldownEvaluator reports an undefined value when there is no default export', async () => {
+    const evaluator = new RolldownEvaluator();
+    const result = await evaluator.evaluate(
+        '\0comptime:/fake/nodefault.ts?comptime=0',
+        `export const __comptime_watch = ["a.txt"];`,
+    );
+    assertEquals(result.value, undefined);
+    assertEquals(result.watchFiles, ['a.txt']);
+});
+
+// plugin surface: options and instance state
+
+Deno.test('comptime plugin forwards exclude to the transformer', async () => {
+    const p = comptimePlugin({ exclude: '**/skipped.ts' }) as any;
+    const code = `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`;
+    assertEquals(await p.transform.call({}, code, '/src/skipped.ts'), undefined);
+    const kept = await p.transform.call({}, code, '/src/kept.ts');
+    assertStringIncludes(kept.code, 'x = 1');
+});
+
+Deno.test('comptime plugin forwards include to the transformer', async () => {
+    const p = comptimePlugin({ include: '**/src/**' }) as any;
+    const code = `import { comptime } from "comptime";\nexport const x = comptime(() => 2);`;
+    assertEquals(await p.transform.call({}, code, '/other/f.ts'), undefined);
+    const kept = await p.transform.call({}, code, '/src/f.ts');
+    assertStringIncludes(kept.code, 'x = 2');
+});
+
+Deno.test('comptime plugin forwards custom serializers to the transformer', async () => {
+    const p = comptimePlugin({
+        serializers: [
+            {
+                test: (v: unknown) => typeof v === 'number',
+                serialize: (v: unknown) => `/* n */ ${v}`,
+            },
+        ],
+    }) as any;
+    const result = await p.transform.call(
+        {},
+        `import { comptime } from "comptime";\nexport const x = comptime(() => 3);`,
+        '/src/ser.ts',
+    );
+    assertStringIncludes(result.code, '/* n */ 3');
+});
+
+Deno.test('comptime plugin returns code and a source map naming the module', async () => {
+    const p = comptimePlugin() as any;
+    const result = await p.transform.call(
+        {},
+        `import { comptime } from "comptime";\nexport const x = comptime(() => 1 + 1);`,
+        '/src/mapped.ts',
+    );
+    assertStringIncludes(result.code, 'x = 2');
+    assertEquals(result.map.sources, ['/src/mapped.ts']);
+});
+
+// A plugin instance owns its evaluator and its cache, so nothing carries from
+// one `comptime()` call to another. Counting loads of a virtual module supplied
+// through innerPlugins covers both at once.
+function countingInnerPlugin(counter: { loads: number }) {
+    return {
+        name: 'counting-virtual',
+        resolveId: (id: string) => (id === 'counted:value' ? '\0counted:value' : null),
+        load: (id: string) => {
+            if (id !== '\0counted:value') return null;
+            counter.loads++;
+            return `export const V = 5;`;
+        },
+    };
+}
+
+Deno.test('comptime plugin forwards innerPlugins to its evaluator', async () => {
+    const counter = { loads: 0 };
+    const p = comptimePlugin({ innerPlugins: [countingInnerPlugin(counter)] }) as any;
+    const result = await p.transform.call(
+        {},
+        `import { comptime } from "comptime";\nimport { V } from "counted:value";\nexport const x = comptime(() => V);`,
+        '/src/inner.ts',
+    );
+    assertStringIncludes(result.code, 'x = 5');
+    assertEquals(counter.loads, 1);
+});
+
+Deno.test('comptime plugin caches within an instance and starts empty in a new one', async () => {
+    const counter = { loads: 0 };
+    const options = { innerPlugins: [countingInnerPlugin(counter)] };
+    const code = `import { comptime } from "comptime";\nimport { V } from "counted:value";\nexport const x = comptime(() => V);`;
+    const first = comptimePlugin(options) as any;
+    await first.transform.call({}, code, '/src/inst.ts');
+    await first.transform.call({}, code, '/src/inst.ts');
+    assertEquals(counter.loads, 1);
+
+    const second = comptimePlugin(options) as any;
+    await second.transform.call({}, code, '/src/inst.ts');
+    assertEquals(counter.loads, 2);
+});
+
+Deno.test('comptime plugin surfaces transform errors as ComptimeTransformError', async () => {
+    const p = comptimePlugin() as any;
+    await assertRejects(
+        () =>
+            p.transform.call(
+                {},
+                `import { comptime } from "comptime";\nexport const x = comptime((n) => n);`,
+                '/src/bad.ts',
+            ),
+        ComptimeTransformError,
+        'comptime() requires a single arrow function with no parameters',
+    );
+});
+
+Deno.test('comptime plugin watchChange drops the cache whatever it is passed', async () => {
+    const counter = { loads: 0 };
+    const p = comptimePlugin({ innerPlugins: [countingInnerPlugin(counter)] }) as any;
+    const code = `import { comptime } from "comptime";\nimport { V } from "counted:value";\nexport const x = comptime(() => V);`;
+    await p.transform.call({}, code, '/src/wc.ts');
+    // The hook reads none of its arguments, so a host calling it with none at
+    // all still invalidates.
+    p.watchChange.call({});
+    await p.transform.call({}, code, '/src/wc.ts');
+    assertEquals(counter.loads, 2);
+});
+
+// createVirtualModule: the watch shim against a local declaration
+
+Deno.test('createVirtualModule omits the watch shim when a declaration binds watch', () => {
+    const decl: TopLevelDecl = {
+        names: ['watch'],
+        source: 'const watch = (p) => p;',
+        start: 0,
+        end: 23,
+        refs: new Set(),
+    };
+    const src = createVirtualModule([], [decl], `return watch("a.txt");`);
+    assertEquals(src.includes('const watch = (path)'), false);
+    assertStringIncludes(src, 'const watch = (p) => p;');
+});
+
+Deno.test('createVirtualModule keeps the shim for a declaration of another name', () => {
+    const decl: TopLevelDecl = {
+        names: ['other'],
+        source: 'const other = 1;',
+        start: 0,
+        end: 16,
+        refs: new Set(),
+    };
+    const src = createVirtualModule([], [decl], `return other;`);
+    assertStringIncludes(src, 'const watch = (path)');
+});
+
+// collectScopedReferences
+
+Deno.test('collectScopedReferences reports free identifiers only', () => {
+    const { program } = parseSync('/f.ts', `const f = () => outer + 1;`, {
+        lang: 'ts',
+        sourceType: 'module',
+    });
+    const refs = collectScopedReferences(program);
+    assertEquals(refs.has('outer'), true);
+    // `f` is declared by the program itself, so it is bound, not free.
+    assertEquals(refs.has('f'), false);
+});
+
+Deno.test('collectScopedReferences excludes parameters and inner declarations', () => {
+    const { program } = parseSync(
+        '/f.ts',
+        `function f(a) { const b = 1; return a + b + c; }`,
+        { lang: 'ts', sourceType: 'module' },
+    );
+    const refs = collectScopedReferences(program);
+    assertEquals(refs.has('a'), false);
+    assertEquals(refs.has('b'), false);
+    assertEquals(refs.has('c'), true);
+});
+
+Deno.test('collectScopedReferences excludes catch params and loop bindings', () => {
+    const { program } = parseSync(
+        '/f.ts',
+        `function f() { try { for (const i of items) use(i); } catch (err) { report(err); } }`,
+        { lang: 'ts', sourceType: 'module' },
+    );
+    const refs = collectScopedReferences(program);
+    assertEquals(refs.has('i'), false);
+    assertEquals(refs.has('err'), false);
+    assertEquals([...['items', 'use', 'report']].every((n) => refs.has(n)), true);
+});
+
+Deno.test('collectScopedReferences excludes a var hoisted out of a nested block', () => {
+    const { program } = parseSync(
+        '/f.ts',
+        `function f() { if (cond) { var hoisted = 1; } return hoisted; }`,
+        { lang: 'ts', sourceType: 'module' },
+    );
+    const refs = collectScopedReferences(program);
+    assertEquals(refs.has('hoisted'), false);
+    assertEquals(refs.has('cond'), true);
+});
+
+Deno.test('collectScopedReferences keeps a superclass but not a class expression name', () => {
+    // A named class *expression* binds its own name only inside itself, and is
+    // the only shape that reaches the class branch: a top-level declaration's
+    // name is already bound by the enclosing Program.
+    const { program } = parseSync(
+        '/f.ts',
+        `const C = class Inner extends Base { m() { return Inner; } };`,
+        { lang: 'ts', sourceType: 'module' },
+    );
+    const refs = collectScopedReferences(program);
+    assertEquals(refs.has('Inner'), false);
+    assertEquals(refs.has('Base'), true);
 });

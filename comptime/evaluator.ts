@@ -103,7 +103,8 @@ export class RolldownEvaluator {
 }
 
 // Load local files directly so deno-plugin's WASM loader doesn't handle them
-function localFilesPlugin(): Plugin {
+// Exported for tests only.
+export function localFilesPlugin(): Plugin {
     return {
         name: 'comptime-local-files',
         resolveId(id) {
@@ -122,7 +123,8 @@ function localFilesPlugin(): Plugin {
 
 const configCache = new Map<string, string | undefined>();
 
-function findDenoConfig(startDir: string): string | undefined {
+/** Exported for tests only. */
+export function findDenoConfig(startDir: string): string | undefined {
     if (configCache.has(startDir)) return configCache.get(startDir);
 
     let dir = startDir;
@@ -147,7 +149,8 @@ function findDenoConfig(startDir: string): string | undefined {
     return undefined;
 }
 
-function virtualIdToSourcePath(virtualId: string): string {
+/** Exported for tests only. */
+export function virtualIdToSourcePath(virtualId: string): string {
     return virtualId
         .slice("\0comptime:".length)
         .replace(/\?comptime=\d+$/, "");
