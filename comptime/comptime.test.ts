@@ -7,8 +7,9 @@ import {
     assertStringIncludes,
     assertThrows,
 } from '@std/assert';
-import { parseSync } from 'rolldown/experimental';
+import { parseSync } from 'rolldown/utils';
 import { rolldown } from 'rolldown';
+import type { Plugin } from 'rolldown';
 import { join } from '@std/path';
 import { ensureDir } from '@std/fs';
 import { comptime as comptimeRuntime, watch } from './runtime.ts';
@@ -33,15 +34,65 @@ import {
     resolveSpecifier,
 } from './paths.ts';
 import { contentHash, createVirtualModule, serializeValue } from './virtual.ts';
-import { createTransformer } from './transform.ts';
+import {
+    createTransformer,
+    type TransformContext,
+    type TransformResult,
+} from './transform.ts';
 import {
     findDenoConfig,
     localFilesPlugin,
     RolldownEvaluator,
     virtualIdToSourcePath,
     type EvaluateResult,
+    type Evaluator,
 } from './evaluator.ts';
 import { comptime as comptimePlugin } from './plugin.ts';
+
+// Rolldown types each plugin hook as an `ObjectHook` - a bare function or a
+// `{ handler }` wrapper - and gives `transform` a `this` of TransformPluginContext.
+// These plugins register plain functions, so the helpers below pull the function
+// out and invoke it with whatever stub context a test supplies.
+function hookFunction<F>(hook: unknown): F {
+    if (typeof hook === 'function') return hook as F;
+    if (
+        hook &&
+        typeof hook === 'object' &&
+        typeof (hook as { handler?: unknown }).handler === 'function'
+    ) {
+        return (hook as { handler: F }).handler;
+    }
+    throw new TypeError('plugin hook is not a function');
+}
+
+function callTransform(
+    plugin: Plugin,
+    ctx: TransformContext,
+    code: string,
+    id: string,
+): Promise<TransformResult | undefined> {
+    const hook = hookFunction<
+        (this: unknown, code: string, id: string) => Promise<TransformResult | undefined>
+    >(plugin.transform);
+    return hook.call(ctx, code, id);
+}
+
+function callWatchChange(plugin: Plugin, id?: string, change?: { event: string }): void {
+    const hook = hookFunction<
+        (this: unknown, id?: string, change?: { event: string }) => void
+    >(plugin.watchChange);
+    hook.call({}, id, change);
+}
+
+function callResolveId(plugin: Plugin, id: string): unknown {
+    const hook = hookFunction<(this: unknown, id: string) => unknown>(plugin.resolveId);
+    return hook.call(null, id);
+}
+
+function callLoad(plugin: Plugin, id: string): Promise<unknown> {
+    const hook = hookFunction<(this: unknown, id: string) => Promise<unknown>>(plugin.load);
+    return hook.call(null, id);
+}
 
 // runtime
 
@@ -478,22 +529,16 @@ Deno.test('serializeValue throws for unserializable values', () => {
 
 // createTransformer
 
-const mockEvaluator = {
-    evaluate: async (
-        _id: string,
-        _src: string,
-        _plugins?: unknown[],
-    ): Promise<EvaluateResult> => ({
-        value: 55,
-        watchFiles: [],
-    }),
+const mockEvaluator: Evaluator = {
+    evaluate: (): Promise<EvaluateResult> =>
+        Promise.resolve({ value: 55, watchFiles: [] }),
 };
 
 Deno.test(
     'createTransformer.transform replaces comptime call with serialized literal',
     async () => {
         const code = `import { comptime } from "comptime";\nexport const x = comptime(() => 42);`;
-        const transformer = createTransformer(mockEvaluator as any, {});
+        const transformer = createTransformer(mockEvaluator, {});
         const result = await transformer.transform(code, '/src/file.ts', {});
         assertEquals(result !== null, true);
         assertEquals(result!.code.includes('55'), true);
@@ -505,7 +550,7 @@ Deno.test(
     'createTransformer.transform returns null when no comptime calls present',
     async () => {
         const code = `export const x = 1;`;
-        const transformer = createTransformer(mockEvaluator as any, {});
+        const transformer = createTransformer(mockEvaluator, {});
         const result = await transformer.transform(code, '/src/file.ts', {});
         assertEquals(result, null);
     },
@@ -514,9 +559,10 @@ Deno.test(
 Deno.test('createTransformer.transform handles expression-body arrow functions', async () => {
     const code = `import { comptime } from "comptime";\nexport const x = comptime(() => 2 + 2);`;
     const fourEvaluator = {
-        evaluate: async (): Promise<EvaluateResult> => ({ value: 4, watchFiles: [] }),
+        evaluate: (): Promise<EvaluateResult> =>
+            Promise.resolve({ value: 4, watchFiles: [] }),
     };
-    const transformer = createTransformer(fourEvaluator as any, {});
+    const transformer = createTransformer(fourEvaluator, {});
     const result = await transformer.transform(code, '/src/file.ts', {});
     assertEquals(result !== null, true);
     assertEquals(result!.code.includes('4'), true);
@@ -528,12 +574,12 @@ Deno.test(
         const code = `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`;
         let calls = 0;
         const counting = {
-            evaluate: async (): Promise<EvaluateResult> => {
+            evaluate: (): Promise<EvaluateResult> => {
                 calls++;
-                return { value: 1, watchFiles: [] };
+                return Promise.resolve({ value: 1, watchFiles: [] });
             },
         };
-        const transformer = createTransformer(counting as any, {});
+        const transformer = createTransformer(counting, {});
         await transformer.transform(code, '/f.ts', {});
         await transformer.transform(code, '/f.ts', {});
         assertEquals(calls, 1);
@@ -546,12 +592,12 @@ Deno.test(
         const code = `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`;
         let calls = 0;
         const counting = {
-            evaluate: async (): Promise<EvaluateResult> => {
+            evaluate: (): Promise<EvaluateResult> => {
                 calls++;
-                return { value: 1, watchFiles: [] };
+                return Promise.resolve({ value: 1, watchFiles: [] });
             },
         };
-        const transformer = createTransformer(counting as any, {});
+        const transformer = createTransformer(counting, {});
         await transformer.transform(code, '/f.ts', {});
         transformer.invalidate();
         await transformer.transform(code, '/f.ts', {});
@@ -563,7 +609,7 @@ Deno.test(
     'createTransformer.transform throws ComptimeTransformError for arrow with params',
     async () => {
         const code = `import { comptime } from "comptime";\nexport const x = comptime((n: number) => n);`;
-        const transformer = createTransformer(mockEvaluator as any, {});
+        const transformer = createTransformer(mockEvaluator, {});
         await assertRejects(
             () => transformer.transform(code, '/f.ts', {}),
             ComptimeTransformError,
@@ -1564,7 +1610,7 @@ function recordingEvaluator(value: unknown = 1, watchFiles: string[] = []) {
 
 async function virtualSourceFor(code: string, id = '/src/f.ts'): Promise<string> {
     const rec = recordingEvaluator();
-    const transformer = createTransformer(rec as any, {});
+    const transformer = createTransformer(rec, {});
     await transformer.transform(code, id, {});
     return rec.sources[0];
 }
@@ -1716,7 +1762,7 @@ export const x = comptime(() => { const a = 5; return a; });
 
 Deno.test('createTransformer hoists different import sets for different calls in one file', async () => {
     const rec = recordingEvaluator();
-    const transformer = createTransformer(rec as any, {});
+    const transformer = createTransformer(rec, {});
     await transformer.transform(
         `
 import { comptime } from "comptime";
@@ -1824,7 +1870,7 @@ export const x = comptime(async () => {
 
 Deno.test('createTransformer registers watch files for local imports only', async () => {
     const watched: string[] = [];
-    const transformer = createTransformer(recordingEvaluator() as any, {});
+    const transformer = createTransformer(recordingEvaluator(), {});
     await transformer.transform(
         `
 import { comptime } from "comptime";
@@ -1840,7 +1886,7 @@ export const x = comptime(() => a + b);
 
 Deno.test('createTransformer does not register watch files for unused imports', async () => {
     const watched: string[] = [];
-    const transformer = createTransformer(recordingEvaluator() as any, {});
+    const transformer = createTransformer(recordingEvaluator(), {});
     await transformer.transform(
         `
 import { comptime } from "comptime";
@@ -1855,7 +1901,7 @@ export const x = comptime(() => 1);
 
 Deno.test('createTransformer forwards watch files reported by the evaluator', async () => {
     const watched: string[] = [];
-    const transformer = createTransformer(recordingEvaluator(1, ['/data/one.json']) as any, {});
+    const transformer = createTransformer(recordingEvaluator(1, ['/data/one.json']), {});
     await transformer.transform(
         `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`,
         '/src/f.ts',
@@ -1884,7 +1930,7 @@ export const x = comptime(() => {
 
 Deno.test('createTransformer skips watch registration on a cache hit and re-registers after invalidate', async () => {
     const watched: string[] = [];
-    const transformer = createTransformer(recordingEvaluator(1, ['/data/one.json']) as any, {});
+    const transformer = createTransformer(recordingEvaluator(1, ['/data/one.json']), {});
     const code = `
 import { comptime } from "comptime";
 import { a } from "./a.ts";
@@ -1901,7 +1947,7 @@ export const x = comptime(() => a);
 });
 
 Deno.test('createTransformer works when the context provides no addWatchFile', async () => {
-    const transformer = createTransformer(recordingEvaluator(1, ['/data/one.json']) as any, {});
+    const transformer = createTransformer(recordingEvaluator(1, ['/data/one.json']), {});
     const result = await transformer.transform(
         `import { comptime } from "comptime";\nimport { a } from "./a.ts";\nexport const x = comptime(() => a);`,
         '/src/f.ts',
@@ -1920,7 +1966,7 @@ Deno.test('createTransformer cache keys differ when a hoisted import path differ
             return Promise.resolve({ value: 1, watchFiles: [] });
         },
     };
-    const transformer = createTransformer(counting as any, {});
+    const transformer = createTransformer(counting, {});
     const code = `import { comptime } from "comptime";\nimport { a } from "./a.ts";\nexport const x = comptime(() => a);`;
     await transformer.transform(code, '/one/f.ts', {});
     await transformer.transform(code, '/two/f.ts', {});
@@ -1935,7 +1981,7 @@ Deno.test('createTransformer cache is shared across files with identical virtual
             return Promise.resolve({ value: 1, watchFiles: [] });
         },
     };
-    const transformer = createTransformer(counting as any, {});
+    const transformer = createTransformer(counting, {});
     const code = `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`;
     await transformer.transform(code, '/one/f.ts', {});
     await transformer.transform(code, '/two/f.ts', {});
@@ -1950,7 +1996,7 @@ Deno.test('createTransformer cache key includes referenced Deno.env values', asy
             return Promise.resolve({ value: 1, watchFiles: [] });
         },
     };
-    const transformer = createTransformer(counting as any, {});
+    const transformer = createTransformer(counting, {});
     const code = `import { comptime } from "comptime";\nexport const x = comptime(() => Deno.env.get("COMPTIME_TEST_KEY"));`;
     Deno.env.set('COMPTIME_TEST_KEY', 'one');
     try {
@@ -2073,7 +2119,7 @@ Deno.test('createTransformer keeps caching when a dependency cannot be read', as
             return Promise.resolve({ value: 1, watchFiles: ['/does/not/exist.json'] });
         },
     };
-    const transformer = createTransformer(counting as any, {});
+    const transformer = createTransformer(counting, {});
     // Neither the import nor the watched path exists; both stamp as unreadable,
     // which is a stable state, so the second transform is still a cache hit.
     const code = `import { comptime } from "comptime";\nimport { a } from "./missing.ts";\nexport const x = comptime(() => a);`;
@@ -2091,7 +2137,7 @@ Deno.test('createTransformer re-evaluates once a missing dependency appears', as
                 return Promise.resolve({ value: count, watchFiles: [] });
             },
         };
-        const transformer = createTransformer(counting as any, {});
+        const transformer = createTransformer(counting, {});
         const code = `import { comptime } from "comptime";\nimport { a } from "./lib.ts";\nexport const x = comptime(() => a);`;
         await transformer.transform(code, join(dir, 'entry.ts'), {});
         assertEquals(count, 1);
@@ -2106,7 +2152,7 @@ Deno.test('createTransformer tolerates a dependency that is a directory', async 
     await withDepsFixture(async (dir) => {
         await ensureDir(join(dir, 'lib.ts'));
         const rec = recordingEvaluator(7);
-        const transformer = createTransformer(rec as any, {});
+        const transformer = createTransformer(rec, {});
         const code = `import { comptime } from "comptime";\nimport { a } from "./lib.ts";\nexport const x = comptime(() => a);`;
         const result = await transformer.transform(code, join(dir, 'entry.ts'), {});
         assertStringIncludes(result!.code, 'x = 7');
@@ -2138,7 +2184,7 @@ Deno.test(
                     return Promise.resolve({ value: count, watchFiles: [] });
                 },
             };
-            const transformer = createTransformer(editing as any, {});
+            const transformer = createTransformer(editing, {});
             const code = `import { comptime } from "comptime";\nimport { N } from "./lib.ts";\nexport const x = comptime(() => N);`;
             await transformer.transform(code, join(dir, 'entry.ts'), {});
             assertEquals(count, 1);
@@ -2168,7 +2214,7 @@ Deno.test(
                     return Promise.resolve({ value: seen, watchFiles: [data] });
                 },
             };
-            const transformer = createTransformer(editing as any, {});
+            const transformer = createTransformer(editing, {});
             const code = `import { comptime, watch } from "comptime";\nexport const x = comptime(() => { watch("${data}"); return 1; });`;
             const first = await transformer.transform(code, join(dir, 'entry.ts'), {});
             assertStringIncludes(first!.code, '"first"');
@@ -2203,7 +2249,7 @@ Deno.test(
                     return Promise.resolve({ value: seen, watchFiles: [data] });
                 },
             };
-            const transformer = createTransformer(editing as any, {});
+            const transformer = createTransformer(editing, {});
             const code = `import { comptime, watch } from "comptime";\nexport const x = comptime(() => { watch("${data}"); return 1; });`;
             const first = await transformer.transform(code, join(dir, 'entry.ts'), {});
             assertStringIncludes(first!.code, '"first"');
@@ -2236,7 +2282,7 @@ Deno.test(
                     return Promise.resolve({ value: seen, watchFiles: [data] });
                 },
             };
-            const transformer = createTransformer(editing as any, {});
+            const transformer = createTransformer(editing, {});
             const code = `import { comptime, watch } from "comptime";\nexport const x = comptime(() => { watch("${data}"); return 1; });`;
             const first = await transformer.transform(code, join(dir, 'entry.ts'), {});
             assertStringIncludes(first!.code, '"first"');
@@ -2268,18 +2314,21 @@ Deno.test(
         };
         const opened: string[] = [];
         const realOpen = Deno.open;
-        (Deno as any).open = (path: string | URL, opts?: Deno.OpenOptions) => {
+        (Deno as { open: typeof Deno.open }).open = ((
+            path: string | URL,
+            opts?: Deno.OpenOptions,
+        ) => {
             opened.push(String(path));
             return realOpen(path, opts);
-        };
+        }) as typeof Deno.open;
         try {
-            const transformer = createTransformer(evaluator as any, {});
+            const transformer = createTransformer(evaluator, {});
             const code = `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`;
             // Twice, so both the recording pass and the validating pass are covered.
             await transformer.transform(code, '/src/f.ts', {});
             await transformer.transform(code, '/src/f.ts', {});
         } finally {
-            (Deno as any).open = realOpen;
+            (Deno as { open: typeof Deno.open }).open = realOpen;
         }
         // Not files: opening them can only ever fail, and recording them would add a
         // dependency that can never invalidate. A plain relative path still counts.
@@ -2298,7 +2347,7 @@ Deno.test('hasUriScheme distinguishes specifiers from relative paths', () => {
 // createTransformer: options and results
 
 Deno.test('createTransformer.transform returns null for excluded ids', async () => {
-    const transformer = createTransformer(mockEvaluator as any, { exclude: ['**/skip/**'] });
+    const transformer = createTransformer(mockEvaluator, { exclude: ['**/skip/**'] });
     assertEquals(await transformer.transform(
         `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`,
         '/skip/f.ts',
@@ -2307,7 +2356,7 @@ Deno.test('createTransformer.transform returns null for excluded ids', async () 
 });
 
 Deno.test('createTransformer.transform returns null for ids outside include', async () => {
-    const transformer = createTransformer(mockEvaluator as any, { include: ['**/src/**'] });
+    const transformer = createTransformer(mockEvaluator, { include: ['**/src/**'] });
     assertEquals(await transformer.transform(
         `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`,
         '/other/f.ts',
@@ -2316,7 +2365,7 @@ Deno.test('createTransformer.transform returns null for ids outside include', as
 });
 
 Deno.test('createTransformer.transform returns null for virtual (\\0-prefixed) ids', async () => {
-    const transformer = createTransformer(mockEvaluator as any, {});
+    const transformer = createTransformer(mockEvaluator, {});
     assertEquals(await transformer.transform(
         `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`,
         '\0virtual.ts',
@@ -2325,7 +2374,7 @@ Deno.test('createTransformer.transform returns null for virtual (\\0-prefixed) i
 });
 
 Deno.test('createTransformer.transform returns null when comptime is imported but never called', async () => {
-    const transformer = createTransformer(mockEvaluator as any, {});
+    const transformer = createTransformer(mockEvaluator, {});
     assertEquals(await transformer.transform(
         `import { comptime } from "comptime";\nexport const x = 1;`,
         '/f.ts',
@@ -2334,7 +2383,7 @@ Deno.test('createTransformer.transform returns null when comptime is imported bu
 });
 
 Deno.test('createTransformer.transform returns null when comptime() comes from another module', async () => {
-    const transformer = createTransformer(mockEvaluator as any, {});
+    const transformer = createTransformer(mockEvaluator, {});
     assertEquals(await transformer.transform(
         `import { comptime } from "./local.ts";\nexport const x = comptime(() => 1);`,
         '/f.ts',
@@ -2343,7 +2392,7 @@ Deno.test('createTransformer.transform returns null when comptime() comes from a
 });
 
 Deno.test('createTransformer.transform honours an aliased comptime import', async () => {
-    const transformer = createTransformer(mockEvaluator as any, {});
+    const transformer = createTransformer(mockEvaluator, {});
     const result = await transformer.transform(
         `import { comptime as ct } from "comptime";\nexport const x = ct(() => 1);`,
         '/f.ts',
@@ -2363,7 +2412,7 @@ Deno.test('createTransformer.transform replaces every call in a file', async () 
                 watchFiles: [],
             }),
     };
-    const transformer = createTransformer(byBody as any, {});
+    const transformer = createTransformer(byBody, {});
     const result = await transformer.transform(
         `
 import { comptime } from "comptime";
@@ -2381,7 +2430,7 @@ export const c = comptime(() => 3);
 });
 
 Deno.test('createTransformer.transform handles a call nested inside another expression', async () => {
-    const transformer = createTransformer(mockEvaluator as any, {});
+    const transformer = createTransformer(mockEvaluator, {});
     const result = await transformer.transform(
         `import { comptime } from "comptime";\nexport const obj = { n: comptime(() => 1) + 1 };`,
         '/f.ts',
@@ -2392,7 +2441,7 @@ Deno.test('createTransformer.transform handles a call nested inside another expr
 
 Deno.test('createTransformer.transform applies custom serializers', async () => {
     const transformer = createTransformer(
-        { evaluate: () => Promise.resolve({ value: new Date(0), watchFiles: [] }) } as any,
+        { evaluate: () => Promise.resolve({ value: new Date(0), watchFiles: [] }) },
         {
             serializers: [
                 { test: (v: unknown) => v instanceof Date, serialize: () => 'DATE_LITERAL' },
@@ -2416,7 +2465,7 @@ Deno.test('createTransformer.transform forwards innerPlugins to the evaluator', 
                 seen = plugins;
                 return Promise.resolve({ value: 1, watchFiles: [] });
             },
-        } as any,
+        },
         { innerPlugins: [plugin] },
     );
     await transformer.transform(
@@ -2437,7 +2486,7 @@ Deno.test('createTransformer.transform passes a distinct virtual id per call ind
                 idByBody.set(src.match(/return \((\d)\);/)![1], id);
                 return Promise.resolve({ value: 1, watchFiles: [] });
             },
-        } as any,
+        },
         {},
     );
     await transformer.transform(
@@ -2451,7 +2500,7 @@ Deno.test('createTransformer.transform passes a distinct virtual id per call ind
 });
 
 Deno.test('createTransformer.transform produces a source map naming the original file', async () => {
-    const transformer = createTransformer(mockEvaluator as any, {});
+    const transformer = createTransformer(mockEvaluator, {});
     const result = await transformer.transform(
         `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`,
         '/src/f.ts',
@@ -2466,7 +2515,7 @@ Deno.test('createTransformer.transform produces a source map naming the original
 
 Deno.test('createTransformer.transform reports loc and frame for evaluation errors', async () => {
     const transformer = createTransformer(
-        { evaluate: () => Promise.reject(new Error('kaboom')) } as any,
+        { evaluate: () => Promise.reject(new Error('kaboom')) },
         {},
     );
     const err = await assertRejects(
@@ -2491,14 +2540,14 @@ Deno.test('createTransformer.transform reports the earliest failing call when se
     const transformer = createTransformer(
         {
             evaluate: (_id: string, src: string) =>
-                new Promise((_, reject) => {
+                new Promise<EvaluateResult>((_, reject) => {
                     const isFirst = src.includes('return (1);');
                     setTimeout(
                         () => reject(new Error(isFirst ? 'first' : 'second')),
                         isFirst ? 20 : 0,
                     );
                 }),
-        } as any,
+        },
         {},
     );
     const err = await assertRejects(
@@ -2516,7 +2565,7 @@ Deno.test('createTransformer.transform reports the earliest failing call when se
 
 Deno.test('createTransformer.transform does not double-prefix messages already starting with comptime', async () => {
     const transformer = createTransformer(
-        { evaluate: () => Promise.reject(new Error('comptime inner build failed: nope')) } as any,
+        { evaluate: () => Promise.reject(new Error('comptime inner build failed: nope')) },
         {},
     );
     const err = await assertRejects(
@@ -2532,7 +2581,7 @@ Deno.test('createTransformer.transform does not double-prefix messages already s
 });
 
 Deno.test('createTransformer.transform stringifies non-Error rejections', async () => {
-    const transformer = createTransformer({ evaluate: () => Promise.reject('plain string') } as any, {});
+    const transformer = createTransformer({ evaluate: () => Promise.reject('plain string') }, {});
     await assertRejects(
         () =>
             transformer.transform(
@@ -2546,7 +2595,7 @@ Deno.test('createTransformer.transform stringifies non-Error rejections', async 
 });
 
 Deno.test('createTransformer.transform times out slow evaluations', async () => {
-    const transformer = createTransformer({ evaluate: () => new Promise(() => {}) } as any, {
+    const transformer = createTransformer({ evaluate: () => new Promise<EvaluateResult>(() => {}) }, {
         timeout: 25,
     });
     await assertRejects(
@@ -2563,7 +2612,7 @@ Deno.test('createTransformer.transform times out slow evaluations', async () => 
 
 Deno.test('createTransformer.transform reports loc and frame for serialization errors', async () => {
     const transformer = createTransformer(
-        { evaluate: () => Promise.resolve({ value: () => {}, watchFiles: [] }) } as any,
+        { evaluate: () => Promise.resolve({ value: () => {}, watchFiles: [] }) },
         {},
     );
     const err = await assertRejects(
@@ -2582,7 +2631,7 @@ Deno.test('createTransformer.transform reports loc and frame for serialization e
 });
 
 Deno.test('createTransformer.transform rejects function-expression callbacks with parameters', async () => {
-    const transformer = createTransformer(mockEvaluator as any, {});
+    const transformer = createTransformer(mockEvaluator, {});
     await assertRejects(
         () =>
             transformer.transform(
@@ -2603,7 +2652,7 @@ Deno.test('createTransformer.transform does not cache failed evaluations', async
                 count++;
                 return Promise.reject(new Error('always fails'));
             },
-        } as any,
+        },
         {},
     );
     const code = `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`;
@@ -2615,7 +2664,7 @@ Deno.test('createTransformer.transform does not cache failed evaluations', async
 // plugin surface
 
 Deno.test('comptime plugin exposes the expected hook surface', () => {
-    const p = comptimePlugin() as any;
+    const p = comptimePlugin();
     assertEquals(p.name, 'comptime');
     assertEquals(p.enforce, 'pre');
     assertEquals(typeof p.transform, 'function');
@@ -2623,14 +2672,14 @@ Deno.test('comptime plugin exposes the expected hook surface', () => {
 });
 
 Deno.test('comptime plugin does not register resolveId or load hooks', () => {
-    const p = comptimePlugin() as any;
+    const p = comptimePlugin();
     assertEquals(p.resolveId, undefined);
     assertEquals(p.load, undefined);
 });
 
 Deno.test('comptime plugin transform returns undefined for non-comptime modules', async () => {
-    const p = comptimePlugin() as any;
-    assertEquals(await p.transform.call({}, 'export const x = 1;', '/f.ts'), undefined);
+    const p = comptimePlugin();
+    assertEquals(await callTransform(p, {}, 'export const x = 1;', '/f.ts'), undefined);
 });
 
 Deno.test('comptime plugin transform reports watch files through the plugin context', async () => {
@@ -2640,8 +2689,8 @@ Deno.test('comptime plugin transform reports watch files through the plugin cont
         const lib = join(dir, 'lib.ts').replace(/\\/g, '/');
         await Deno.writeTextFile(lib, `export const N = 3;`);
         const watched: string[] = [];
-        const p = comptimePlugin() as any;
-        await p.transform.call(
+        const p = comptimePlugin();
+        await callTransform(p,
             { addWatchFile: (id: string) => void watched.push(id) },
             `import { comptime } from "comptime";\nimport { N } from "./lib.ts";\nexport const x = comptime(() => N);`,
             join(dir, 'entry.ts'),
@@ -2654,7 +2703,7 @@ Deno.test('comptime plugin transform reports watch files through the plugin cont
 });
 
 Deno.test('comptime plugin watchChange invalidates the cache', async () => {
-    const p = comptimePlugin() as any;
+    const p = comptimePlugin();
     const dir = join(WATCH_FIXTURE_DIR, 'invalidate');
     await ensureDir(dir);
     try {
@@ -2662,15 +2711,15 @@ Deno.test('comptime plugin watchChange invalidates the cache', async () => {
         const entry = join(dir, 'entry.ts');
         await Deno.writeTextFile(dataFile, 'first');
         const code = `import { comptime } from "comptime";\nexport const v = comptime(async () => await Deno.readTextFile("${dataFile}"));`;
-        const first = await p.transform.call({}, code, entry);
+        const first = await callTransform(p, {}, code, entry);
         assertStringIncludes(first.code, '"first"');
 
         await Deno.writeTextFile(dataFile, 'second');
-        const cached = await p.transform.call({}, code, entry);
+        const cached = await callTransform(p, {}, code, entry);
         assertStringIncludes(cached.code, '"first"');
 
-        p.watchChange.call({}, dataFile, { event: 'update' });
-        const fresh = await p.transform.call({}, code, entry);
+        callWatchChange(p, dataFile, { event: 'update' });
+        const fresh = await callTransform(p, {}, code, entry);
         assertStringIncludes(fresh.code, '"second"');
     } finally {
         await Deno.remove(dir, { recursive: true });
@@ -3069,7 +3118,7 @@ Deno.test(
     'createTransformer does not inline a transitively reached declaration containing a comptime call',
     async () => {
         const rec = recordingEvaluator();
-        const transformer = createTransformer(rec as any, {});
+        const transformer = createTransformer(rec, {});
         await transformer.transform(
             `
 import { comptime } from "comptime";
@@ -3262,7 +3311,7 @@ export const x = comptime(() => Widget);
 });
 
 Deno.test('createTransformer.transform rejects a directly nested comptime call', async () => {
-    const transformer = createTransformer(mockEvaluator as any, {});
+    const transformer = createTransformer(mockEvaluator, {});
     const err = await assertRejects(
         () =>
             transformer.transform(
@@ -3285,7 +3334,7 @@ Deno.test('createTransformer.transform rejects a directly nested comptime call',
 Deno.test(
     'createTransformer.transform rejects a nested comptime call inside a function in the callback',
     async () => {
-        const transformer = createTransformer(mockEvaluator as any, {});
+        const transformer = createTransformer(mockEvaluator, {});
         const err = await assertRejects(
             () =>
                 transformer.transform(
@@ -3331,7 +3380,7 @@ Deno.test('createTransformer.transform accepts a non-call comptime reference in 
 
 Deno.test('createTransformer.transform still evaluates two sibling comptime calls', async () => {
     const rec = recordingEvaluator();
-    const transformer = createTransformer(rec as any, {});
+    const transformer = createTransformer(rec, {});
     const result = await transformer.transform(
         `
 import { comptime } from "comptime";
@@ -3462,15 +3511,18 @@ Deno.test('stampAll reads a repeated path only once', async () => {
         await Deno.writeTextFile(file, 'x');
         const opened: string[] = [];
         const realOpen = Deno.open;
-        (Deno as any).open = (path: string | URL, opts?: Deno.OpenOptions) => {
+        (Deno as { open: typeof Deno.open }).open = ((
+            path: string | URL,
+            opts?: Deno.OpenOptions,
+        ) => {
             opened.push(String(path));
             return realOpen(path, opts);
-        };
+        }) as typeof Deno.open;
         let stamps: Map<string, string>;
         try {
             stamps = await stampAll([file, file, file]);
         } finally {
-            (Deno as any).open = realOpen;
+            (Deno as { open: typeof Deno.open }).open = realOpen;
         }
         // Duplicates are collapsed before any I/O: a dependency named twice is
         // one read, not three.
@@ -3868,26 +3920,26 @@ Deno.test('RolldownEvaluator fails when no discovered config maps the specifier'
 // inert and absolute paths reach the deno plugin instead. Pinned as written.
 
 Deno.test('localFilesPlugin resolves only drive-letter ids', () => {
-    const plugin = localFilesPlugin() as any;
+    const plugin = localFilesPlugin();
     assertEquals(plugin.name, 'comptime-local-files');
-    assertEquals(plugin.resolveId.call(null, 'C:/src/a.ts'), 'C:/src/a.ts');
-    assertEquals(plugin.resolveId.call(null, 'c:\\src\\a.ts'), 'c:\\src\\a.ts');
+    assertEquals(callResolveId(plugin, 'C:/src/a.ts'), 'C:/src/a.ts');
+    assertEquals(callResolveId(plugin, 'c:\\src\\a.ts'), 'c:\\src\\a.ts');
     for (const id of ['/abs/a.ts', './rel.ts', 'npm:lodash', 'jsr:@std/path', 'node:fs'])
-        assertEquals(plugin.resolveId.call(null, id), null);
+        assertEquals(callResolveId(plugin, id), null);
 });
 
 Deno.test('localFilesPlugin loads nothing for ids it did not resolve', async () => {
-    const plugin = localFilesPlugin() as any;
+    const plugin = localFilesPlugin();
     for (const id of ['/abs/a.ts', './rel.ts', 'npm:lodash', '\0virtual:x'])
-        assertEquals(await plugin.load.call(null, id), null);
+        assertEquals(await callLoad(plugin, id), null);
 });
 
 Deno.test('localFilesPlugin reads a drive-letter id from disk', async () => {
-    const plugin = localFilesPlugin() as any;
+    const plugin = localFilesPlugin();
     // Reaching the read - and failing there rather than returning null - is what
     // shows a drive path is routed to the local loader instead of the deno one.
     await assertRejects(
-        () => plugin.load.call(null, 'Q:/no/such/file.ts'),
+        () => callLoad(plugin, 'Q:/no/such/file.ts'),
         Deno.errors.NotFound,
     );
 });
@@ -3955,7 +4007,7 @@ Deno.test('RolldownEvaluator runs the module again for an identical id and sourc
         assertEquals((await evaluator.evaluate(id, source)).value, 1);
         assertEquals((await evaluator.evaluate(id, source)).value, 2);
     } finally {
-        delete (globalThis as any).__comptimeNonceProbe;
+        delete (globalThis as Record<string, unknown>).__comptimeNonceProbe;
     }
 });
 
@@ -3981,18 +4033,18 @@ Deno.test('RolldownEvaluator reports an undefined value when there is no default
 // plugin surface: options and instance state
 
 Deno.test('comptime plugin forwards exclude to the transformer', async () => {
-    const p = comptimePlugin({ exclude: '**/skipped.ts' }) as any;
+    const p = comptimePlugin({ exclude: '**/skipped.ts' });
     const code = `import { comptime } from "comptime";\nexport const x = comptime(() => 1);`;
-    assertEquals(await p.transform.call({}, code, '/src/skipped.ts'), undefined);
-    const kept = await p.transform.call({}, code, '/src/kept.ts');
+    assertEquals(await callTransform(p, {}, code, '/src/skipped.ts'), undefined);
+    const kept = await callTransform(p, {}, code, '/src/kept.ts');
     assertStringIncludes(kept.code, 'x = 1');
 });
 
 Deno.test('comptime plugin forwards include to the transformer', async () => {
-    const p = comptimePlugin({ include: '**/src/**' }) as any;
+    const p = comptimePlugin({ include: '**/src/**' });
     const code = `import { comptime } from "comptime";\nexport const x = comptime(() => 2);`;
-    assertEquals(await p.transform.call({}, code, '/other/f.ts'), undefined);
-    const kept = await p.transform.call({}, code, '/src/f.ts');
+    assertEquals(await callTransform(p, {}, code, '/other/f.ts'), undefined);
+    const kept = await callTransform(p, {}, code, '/src/f.ts');
     assertStringIncludes(kept.code, 'x = 2');
 });
 
@@ -4004,8 +4056,8 @@ Deno.test('comptime plugin forwards custom serializers to the transformer', asyn
                 serialize: (v: unknown) => `/* n */ ${v}`,
             },
         ],
-    }) as any;
-    const result = await p.transform.call(
+    });
+    const result = await callTransform(p,
         {},
         `import { comptime } from "comptime";\nexport const x = comptime(() => 3);`,
         '/src/ser.ts',
@@ -4014,8 +4066,8 @@ Deno.test('comptime plugin forwards custom serializers to the transformer', asyn
 });
 
 Deno.test('comptime plugin returns code and a source map naming the module', async () => {
-    const p = comptimePlugin() as any;
-    const result = await p.transform.call(
+    const p = comptimePlugin();
+    const result = await callTransform(p,
         {},
         `import { comptime } from "comptime";\nexport const x = comptime(() => 1 + 1);`,
         '/src/mapped.ts',
@@ -4041,8 +4093,8 @@ function countingInnerPlugin(counter: { loads: number }) {
 
 Deno.test('comptime plugin forwards innerPlugins to its evaluator', async () => {
     const counter = { loads: 0 };
-    const p = comptimePlugin({ innerPlugins: [countingInnerPlugin(counter)] }) as any;
-    const result = await p.transform.call(
+    const p = comptimePlugin({ innerPlugins: [countingInnerPlugin(counter)] });
+    const result = await callTransform(p,
         {},
         `import { comptime } from "comptime";\nimport { V } from "counted:value";\nexport const x = comptime(() => V);`,
         '/src/inner.ts',
@@ -4055,21 +4107,21 @@ Deno.test('comptime plugin caches within an instance and starts empty in a new o
     const counter = { loads: 0 };
     const options = { innerPlugins: [countingInnerPlugin(counter)] };
     const code = `import { comptime } from "comptime";\nimport { V } from "counted:value";\nexport const x = comptime(() => V);`;
-    const first = comptimePlugin(options) as any;
-    await first.transform.call({}, code, '/src/inst.ts');
-    await first.transform.call({}, code, '/src/inst.ts');
+    const first = comptimePlugin(options);
+    await callTransform(first, {}, code, '/src/inst.ts');
+    await callTransform(first, {}, code, '/src/inst.ts');
     assertEquals(counter.loads, 1);
 
-    const second = comptimePlugin(options) as any;
-    await second.transform.call({}, code, '/src/inst.ts');
+    const second = comptimePlugin(options);
+    await callTransform(second, {}, code, '/src/inst.ts');
     assertEquals(counter.loads, 2);
 });
 
 Deno.test('comptime plugin surfaces transform errors as ComptimeTransformError', async () => {
-    const p = comptimePlugin() as any;
+    const p = comptimePlugin();
     await assertRejects(
         () =>
-            p.transform.call(
+            callTransform(p,
                 {},
                 `import { comptime } from "comptime";\nexport const x = comptime((n) => n);`,
                 '/src/bad.ts',
@@ -4081,13 +4133,13 @@ Deno.test('comptime plugin surfaces transform errors as ComptimeTransformError',
 
 Deno.test('comptime plugin watchChange drops the cache whatever it is passed', async () => {
     const counter = { loads: 0 };
-    const p = comptimePlugin({ innerPlugins: [countingInnerPlugin(counter)] }) as any;
+    const p = comptimePlugin({ innerPlugins: [countingInnerPlugin(counter)] });
     const code = `import { comptime } from "comptime";\nimport { V } from "counted:value";\nexport const x = comptime(() => V);`;
-    await p.transform.call({}, code, '/src/wc.ts');
+    await callTransform(p, {}, code, '/src/wc.ts');
     // The hook reads none of its arguments, so a host calling it with none at
     // all still invalidates.
-    p.watchChange.call({});
-    await p.transform.call({}, code, '/src/wc.ts');
+    callWatchChange(p);
+    await callTransform(p, {}, code, '/src/wc.ts');
     assertEquals(counter.loads, 2);
 });
 

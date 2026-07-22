@@ -4,6 +4,7 @@
     "jsr:@deno/loader@0.3": "0.3.14",
     "jsr:@deno/rolldown-plugin@^0.0.10": "0.0.10",
     "jsr:@std/assert@^1.0.19": "1.0.19",
+    "jsr:@std/crypto@^1.0.5": "1.1.0",
     "jsr:@std/fs@^1.0.23": "1.0.23",
     "jsr:@std/internal@^1.0.12": "1.0.13",
     "jsr:@std/path@^1.1.1": "1.1.4",
@@ -11,6 +12,7 @@
     "npm:devalue@^5.8.1": "5.8.1",
     "npm:magic-string@~0.30.21": "0.30.21",
     "npm:micromatch@^4.0.8": "4.0.8",
+    "npm:rolldown@*": "1.0.2",
     "npm:rolldown@^1.0.2": "1.0.2"
   },
   "jsr": {
@@ -29,6 +31,9 @@
       "dependencies": [
         "jsr:@std/internal"
       ]
+    },
+    "@std/crypto@1.1.0": {
+      "integrity": "b8d6d0a6377a32b213af2661ed7bf1062d94feac0c57def5526a8e74a95c3ec8"
     },
     "@std/fs@1.0.23": {
       "integrity": "3ecbae4ce4fee03b180fa710caff36bb5adb66631c46a6460aaad49515565a37",
@@ -242,6 +247,7 @@
     "dependencies": [
       "jsr:@deno/rolldown-plugin@^0.0.10",
       "jsr:@std/assert@^1.0.19",
+      "jsr:@std/crypto@^1.0.5",
       "jsr:@std/fs@^1.0.23",
       "jsr:@std/path@^1.1.4",
       "npm:devalue@^5.8.1",

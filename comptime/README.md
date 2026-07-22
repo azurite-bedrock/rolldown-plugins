@@ -94,7 +94,7 @@ That check is only as good as the timestamps. `ctime` covers the cases where `mt
 
 **Not tracked** — editing one of these can still yield a stale value within the lifetime of a plugin instance:
 
-- _transitive_ imports. Only the file a callback imports directly is hashed, not what that file imports in turn. Call `watch()` on the transitive file if it matters.
+- *transitive* imports. Only the file a callback imports directly is hashed, not what that file imports in turn. Call `watch()` on the transitive file if it matters.
 - files read during evaluation (`Deno.readTextFile`, `fetch` to a local server, ...) without a matching `watch()` call. `watch()` is what makes such a read a declared dependency.
 - `npm:`, `jsr:` and `node:` specifiers, which are pinned by version rather than by content. An argument to `watch()` carrying a scheme (`npm:`, `http:`, ...) is still registered with Rolldown, but it is not a path, so it is left out of the content stamps and can never invalidate an entry.
 
@@ -150,7 +150,7 @@ comptime({
 
 Evaluation errors are reported as `ComptimeTransformError` with a source location and frame pointing at the `comptime(...)` call site in the original file.
 
-```
+```ts
 ComptimeTransformError: comptime evaluation threw: Cannot read file
   src/index.ts:5:18
   export const X = comptime(() => readMissing());

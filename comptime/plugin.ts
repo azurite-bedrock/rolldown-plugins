@@ -8,9 +8,9 @@ import type { ComptimeOptions } from './options.ts';
  * declare it, but hosts that honour plugin ordering read it, so it is kept and
  * declared here rather than cast away.
  */
-type ComptimePlugin = Plugin & { enforce: 'pre' };
+export type ComptimePlugin = Plugin & { enforce: 'pre' };
 
-export function comptime(options: ComptimeOptions = {}): Plugin {
+export function comptime(options: ComptimeOptions = {}): ComptimePlugin {
     const transformer = createTransformer(new RolldownEvaluator(), options);
 
     const plugin: ComptimePlugin = {

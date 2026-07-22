@@ -1,5 +1,12 @@
-import { createHash } from 'node:crypto';
+import { crypto } from '@std/crypto';
 import { dirname } from '@std/path';
+
+/** Lowercase hex encoding of a digest, matching Node's `hash.digest('hex')`. */
+function toHex(digest: ArrayBuffer): string {
+    let hex = '';
+    for (const byte of new Uint8Array(digest)) hex += byte.toString(16).padStart(2, '0');
+    return hex;
+}
 
 /**
  * Stamp for a dependency that cannot be read: missing, a directory, permission
@@ -24,17 +31,22 @@ async function stampFile(path: string): Promise<string> {
     } catch {
         return UNREADABLE_STAMP;
     }
-    const hash = createHash('sha256');
     // One reused buffer rather than `file.readable`, which allocates a fresh
     // chunk per read: measured on a 300MB dependency, this is ~480ms and no
-    // resident growth against ~1.2s and tens of megabytes.
+    // resident growth against ~1.2s and tens of megabytes. `crypto.subtle.digest`
+    // hashes each chunk into its wasm state synchronously before pulling the
+    // next, so the buffer is fully consumed before the following read overwrites
+    // it and no copy per chunk is needed.
     const buf = new Uint8Array(1 << 20);
-    try {
+    async function* chunks(): AsyncGenerator<Uint8Array<ArrayBuffer>> {
         while (true) {
             const n = await file.read(buf);
-            if (n === null) break;
-            hash.update(buf.subarray(0, n));
+            if (n === null) return;
+            yield buf.subarray(0, n);
         }
+    }
+    try {
+        return toHex(await crypto.subtle.digest('SHA-256', chunks()));
     } catch {
         // Opening a directory succeeds on Unix and only fails on read, so this
         // is a normal path, not an exceptional one.
@@ -42,7 +54,6 @@ async function stampFile(path: string): Promise<string> {
     } finally {
         file.close();
     }
-    return hash.digest('hex');
 }
 
 export async function stampAll(paths: string[]): Promise<Map<string, string>> {
