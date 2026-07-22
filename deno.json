@@ -1,9 +1,12 @@
 {
     "name": "@azurite/rolldown-plugins",
-    "version": "0.1.3",
+    "version": "0.2.0",
     "exports": {
         "./comptime": "./comptime/runtime.ts",
         "./comptime/plugin": "./comptime/plugin.ts"
+    },
+    "publish": {
+        "exclude": ["comptime/comptime.test.ts"]
     },
     "imports": {
         "@deno/rolldown-plugin": "jsr:@deno/rolldown-plugin@^0.0.10",
