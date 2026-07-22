@@ -96,7 +96,7 @@ That check is only as good as the timestamps. `ctime` covers the cases where `mt
 
 - _transitive_ imports. Only the file a callback imports directly is hashed, not what that file imports in turn. Call `watch()` on the transitive file if it matters.
 - files read during evaluation (`Deno.readTextFile`, `fetch` to a local server, ...) without a matching `watch()` call. `watch()` is what makes such a read a declared dependency.
-- `npm:`, `jsr:` and `node:` specifiers, which are pinned by version rather than by content. An argument to `watch()` carrying a scheme (`npm:`, `http:`, ...) is likewise not a path and is ignored.
+- `npm:`, `jsr:` and `node:` specifiers, which are pinned by version rather than by content. An argument to `watch()` carrying a scheme (`npm:`, `http:`, ...) is still registered with Rolldown, but it is not a path, so it is left out of the content stamps and can never invalidate an entry.
 
 A file that cannot be read - missing, a directory, permission denied - is not an error: it is recorded as unreadable, and the entry is invalidated as soon as that changes.
 
