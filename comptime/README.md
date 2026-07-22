@@ -64,6 +64,13 @@ export const CONFIG = comptime(() => parseConfig('./app.config.toml'));
 
 Top-level declarations (variables, functions, classes) are also available inside the body.
 
+The callbacks in one file are evaluated together in a single build, so an
+imported module is instantiated once and shared across them, and its top-level
+side effects run once. This is invisible to callbacks that only read from their
+imports - the intended, build-time-pure use - and observable only if one
+callback mutates an imported module's state and another relies on that mutation,
+which caching already makes unreliable across builds.
+
 ## File watching
 
 Use `watch()` to register files as cache dependencies. If a watched file changes during `--watch` mode, the cache is invalidated and the call is re-evaluated:

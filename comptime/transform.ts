@@ -1,7 +1,7 @@
 import { dirname } from '@std/path';
 import MagicString, { type SourceMap } from 'magic-string';
 import type { Plugin, TransformPluginContext } from 'rolldown';
-import type { Evaluator, EvaluateResult } from './evaluator.ts';
+import type { BatchEntry, BatchOutcome, Evaluator } from './evaluator.ts';
 import {
     parseSync,
     collectComptimeBindings,
@@ -10,6 +10,7 @@ import {
     collectTopLevelDeclarations,
     collectIdentifierReferences,
     collectDenoEnvReads,
+    type ComptimeCall,
     type TopLevelDecl,
 } from './ast.ts';
 import { ComptimeTransformError, getLocAndFrame } from './errors.ts';
@@ -21,6 +22,7 @@ import {
 } from './paths.ts';
 import { shouldScan, type ComptimeOptions } from './options.ts';
 import { allUnmodifiedDuring, depsUnchanged, stampAll } from './deps.ts';
+import { withTimeout } from './timeout.ts';
 import { createVirtualModule, contentHash, serializeValue } from './virtual.ts';
 
 /**
@@ -49,19 +51,46 @@ function messageFrom(err: unknown): string {
     return err instanceof Error ? err.message : String(err);
 }
 
-async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-    let timerId: ReturnType<typeof setTimeout> | undefined;
-    const timer = new Promise<never>((_, reject) => {
-        timerId = setTimeout(
-            () => reject(new Error(`comptime evaluation timed out after ${ms}ms`)),
-            ms,
+/**
+ * Evaluates the cache-missed calls of a file and reports each outcome in-band,
+ * never rejecting, so the caller can select the earliest failing call in source
+ * order rather than whichever rejection lands first.
+ *
+ * An evaluator that offers `evaluateBatch` runs them in a single inner build; one
+ * that does not - a test fake, above all - is driven one call at a time exactly
+ * as before, with a per-call timeout. Both surface the same `{ ok, ... }` shape,
+ * so the rest of the transform cannot tell which ran.
+ */
+function evaluateMissed(
+    evaluator: Evaluator,
+    entries: BatchEntry[],
+    innerPlugins: Plugin[] | undefined,
+    timeout: number,
+): Promise<BatchOutcome[]> {
+    if (evaluator.evaluateBatch) {
+        return evaluator.evaluateBatch(entries, innerPlugins, timeout).catch(
+            (err: unknown): BatchOutcome[] => {
+                // evaluateBatch attributes per-call failures itself; a rejection
+                // here is the whole batch giving out, which no single call owns,
+                // so every missed call carries the same message.
+                const message = messageFrom(err);
+                return entries.map(() => ({ ok: false, message }));
+            },
         );
-    });
-    try {
-        return await Promise.race([promise, timer]);
-    } finally {
-        clearTimeout(timerId);
     }
+    return Promise.all(
+        entries.map(async (e): Promise<BatchOutcome> => {
+            try {
+                const r = await withTimeout(
+                    evaluator.evaluate(e.virtualId, e.virtualSource, innerPlugins),
+                    timeout,
+                );
+                return { ok: true, value: r.value, watchFiles: r.watchFiles };
+            } catch (err) {
+                return { ok: false, message: messageFrom(err) };
+            }
+        }),
+    );
 }
 
 /**
@@ -90,6 +119,25 @@ async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
  * those timestamps being truthful.
  */
 type CacheEntry = { literal: string; deps: Map<string, string> };
+
+/**
+ * A call after its virtual module has been built and its cache consulted, but
+ * before evaluation. A `hit` already has its literal; a `miss` carries what
+ * evaluation and, on success, caching will need; an `error` is a fault found
+ * without evaluating (bad parameters), held rather than thrown so the earliest
+ * such fault in source order can still be selected against evaluation failures.
+ */
+type PreparedCall =
+    | { kind: 'hit'; call: ComptimeCall; literal: string }
+    | {
+          kind: 'miss';
+          call: ComptimeCall;
+          virtualId: string;
+          virtualSource: string;
+          key: string;
+          importStamps: Map<string, string>;
+      }
+    | { kind: 'error'; call: ComptimeCall; error: ComptimeTransformError };
 
 export function createTransformer(
     evaluator: Evaluator,
@@ -129,16 +177,35 @@ export function createTransformer(
             const topLevelDecls = collectTopLevelDeclarations(program, code);
             const s = new MagicString(code);
 
-            const tasks = calls.map(async (call) => {
+            // Call-independent, so computed once rather than per call: a
+            // declaration that encloses a comptime call must never be inlined.
+            const inlinable = topLevelDecls.filter(
+                (d) => !calls.some((c) => c.start >= d.start && c.end <= d.end),
+            );
+
+            // Phase 1: build each call's virtual module and consult the cache,
+            // concurrently. This runs everything up to but not including
+            // evaluation, so the misses can then share a single inner build. A
+            // fault found here is held on the call rather than thrown, so it can
+            // be weighed in source order against evaluation failures below.
+            const prepared = await Promise.all(
+                calls.map((call): Promise<PreparedCall> => prepareCall(call)),
+            );
+
+            function prepareCall(call: ComptimeCall): Promise<PreparedCall> {
                 const fn = call.fn;
 
                 if ((fn.params ?? []).length > 0) {
                     const { loc, frame } = getLocAndFrame(code, call.start, id);
-                    throw new ComptimeTransformError(
-                        'comptime() requires a single arrow function with no parameters',
-                        loc,
-                        frame,
-                    );
+                    return Promise.resolve({
+                        kind: 'error',
+                        call,
+                        error: new ComptimeTransformError(
+                            'comptime() requires a single arrow function with no parameters',
+                            loc,
+                            frame,
+                        ),
+                    });
                 }
 
                 // Extract body: expression bodies get wrapped in return; block bodies strip braces
@@ -161,11 +228,6 @@ export function createTransformer(
                 // declaration the callback never names, and evaluation would fail
                 // with "X is not defined".
                 const refs = collectIdentifierReferences(fn.body);
-                // A declaration that encloses a comptime call must never be inlined,
-                // so it also must not contribute its references.
-                const inlinable = topLevelDecls.filter(
-                    (d) => !calls.some((c) => c.start >= d.start && c.end <= d.end),
-                );
                 const selected = new Set<TopLevelDecl>();
                 // Terminates because a pass only repeats when it selected a
                 // declaration: at most one pass per declaration, since `selected`
@@ -185,7 +247,7 @@ export function createTransformer(
                 );
                 // Original source order is preserved by filtering the collected list.
                 const usedDecls = inlinable.filter((d) => selected.has(d));
-                const virtual = createVirtualModule(
+                const virtualSource = createVirtualModule(
                     usedImports,
                     usedDecls,
                     rewrittenBody,
@@ -196,68 +258,111 @@ export function createTransformer(
                     k,
                     Deno.env.get(k) ?? '',
                 ]);
-                const key = await contentHash(virtual, envEntries);
 
-                // Cache hit: skip re-evaluation and watch file registration.
-                // The entry only counts as a hit while its recorded dependencies
-                // still stamp identically, so an edit to an imported or watched
-                // file yields a fresh literal even without watch mode.
-                // invalidate() is called on watchChange, so if any watched file changes
-                // the cache is cleared and the next transform re-registers all watch files.
-                const cached = cache.get(key);
-                if (cached && (await depsUnchanged(cached.deps))) {
+                return (async (): Promise<PreparedCall> => {
+                    const key = await contentHash(virtualSource, envEntries);
+
+                    // Cache hit: skip re-evaluation and watch file registration.
+                    // The entry only counts as a hit while its recorded dependencies
+                    // still stamp identically, so an edit to an imported or watched
+                    // file yields a fresh literal even without watch mode.
+                    // invalidate() is called on watchChange, so if any watched file
+                    // changes the cache is cleared and the next transform re-registers
+                    // all watch files.
+                    const cached = cache.get(key);
+                    if (cached && (await depsUnchanged(cached.deps))) {
+                        return { kind: 'hit', call, literal: cached.literal };
+                    }
+
+                    const localImports = usedImports
+                        .map((b) => b.absSpecifier)
+                        .filter(isLocalFile);
+                    for (const path of localImports) ctx.addWatchFile?.(path);
+
+                    // Stamped before evaluating, and awaited before it: a file edited
+                    // after this point leaves a stamp older than the content the
+                    // evaluation read, which costs a spurious re-evaluation next time
+                    // but can never pin a stale literal. Overlapping these reads with
+                    // the build would forfeit exactly that, since a queued read can
+                    // land after the build has already read the same file.
+                    const importStamps = await stampAll(localImports);
+
                     return {
-                        start: call.start,
-                        end: call.end,
-                        literal: cached.literal,
+                        kind: 'miss',
+                        call,
+                        virtualId: `\0comptime:${id}?comptime=${call.index}`,
+                        virtualSource,
+                        key,
+                        importStamps,
+                    };
+                })();
+            }
+
+            // Phase 2: evaluate every missed call in one inner build (or, for an
+            // evaluator without a batch, one at a time). Started here so that all
+            // import stamps above are already taken - the ordering the cache relies
+            // on - and so a single `startedAt` bounds every call's watch stamping.
+            const misses = prepared.filter(
+                (p): p is Extract<PreparedCall, { kind: 'miss' }> => p.kind === 'miss',
+            );
+            const startedAt = Date.now();
+            const outcomes = new Map<number, BatchOutcome>();
+            if (misses.length > 0) {
+                const settled = await evaluateMissed(
+                    evaluator,
+                    misses.map((m) => ({
+                        virtualId: m.virtualId,
+                        virtualSource: m.virtualSource,
+                    })),
+                    options.innerPlugins as Plugin[] | undefined,
+                    options.timeout ?? DEFAULT_TIMEOUT,
+                );
+                misses.forEach((m, i) => outcomes.set(m.call.index, settled[i]));
+            }
+
+            // Phase 3: resolve each call to a literal or an error, registering
+            // watch files and serializing as it goes. Every call is resolved
+            // before any error is thrown, so a later call's watch registration and
+            // cache entry still land when an earlier call fails - exactly as when
+            // the calls ran as independent concurrent tasks.
+            type Resolved =
+                | { start: number; end: number; literal: string }
+                | { error: ComptimeTransformError };
+            const cacheWrites: Array<{
+                key: string;
+                literal: string;
+                importStamps: Map<string, string>;
+                watchDeps: string[];
+            }> = [];
+            const resolved: Resolved[] = prepared.map((p): Resolved => {
+                if (p.kind === 'error') return { error: p.error };
+                if (p.kind === 'hit') {
+                    return { start: p.call.start, end: p.call.end, literal: p.literal };
+                }
+
+                const outcome = outcomes.get(p.call.index)!;
+                if (outcome.ok === false) {
+                    const { loc, frame } = getLocAndFrame(code, p.call.start, id);
+                    const msg = outcome.message;
+                    return {
+                        error: new ComptimeTransformError(
+                            msg.startsWith('comptime')
+                                ? msg
+                                : `comptime evaluation threw: ${msg}`,
+                            loc,
+                            frame,
+                        ),
                     };
                 }
 
-                const localImports = usedImports
-                    .map((b) => b.absSpecifier)
-                    .filter(isLocalFile);
-                for (const path of localImports) ctx.addWatchFile?.(path);
-
-                // Stamped before evaluating, and awaited before it: a file edited
-                // after this point leaves a stamp older than the content the
-                // evaluation read, which costs a spurious re-evaluation next time
-                // but can never pin a stale literal. Overlapping these reads with
-                // the build would forfeit exactly that, since a queued read can
-                // land after the build has already read the same file.
-                const importStamps = await stampAll(localImports);
-
-                const virtualId = `\0comptime:${id}?comptime=${call.index}`;
-                const startedAt = Date.now();
-                let evalResult: EvaluateResult;
-                try {
-                    evalResult = await withTimeout(
-                        evaluator.evaluate(
-                            virtualId,
-                            virtual,
-                            options.innerPlugins as Plugin[] | undefined,
-                        ),
-                        options.timeout ?? DEFAULT_TIMEOUT,
-                    );
-                } catch (err) {
-                    const { loc, frame } = getLocAndFrame(code, call.start, id);
-                    const msg = messageFrom(err);
-                    throw new ComptimeTransformError(
-                        msg.startsWith('comptime')
-                            ? msg
-                            : `comptime evaluation threw: ${msg}`,
-                        loc,
-                        frame,
-                    );
-                }
-
-                for (const path of evalResult.watchFiles) ctx.addWatchFile?.(path);
+                for (const path of outcome.watchFiles) ctx.addWatchFile?.(path);
 
                 let literal: string;
                 try {
-                    literal = serializeValue(evalResult.value, options.serializers);
+                    literal = serializeValue(outcome.value, options.serializers);
                 } catch (err) {
-                    const { loc, frame } = getLocAndFrame(code, call.start, id);
-                    throw new ComptimeTransformError(messageFrom(err), loc, frame);
+                    const { loc, frame } = getLocAndFrame(code, p.call.start, id);
+                    return { error: new ComptimeTransformError(messageFrom(err), loc, frame) };
                 }
 
                 // Watched paths can only be stamped after evaluation, since that is
@@ -266,39 +371,36 @@ export function createTransformer(
                 // reads did; scheme-carrying arguments (`npm:`, `http:`, ...) are
                 // not files at all and would only record a dependency that can
                 // never invalidate.
-                const watchDeps = evalResult.watchFiles.filter((p) => !hasUriScheme(p));
-                // The literal is returned either way; only recording it as a cache
-                // entry needs the watched files to have held still. The second
-                // check covers writes landing during the stamping itself, so the
-                // stamps and the literal cannot straddle one.
-                if (await allUnmodifiedDuring(watchDeps, startedAt)) {
-                    const watchStamps = await stampAll(watchDeps);
-                    if (await allUnmodifiedDuring(watchDeps, startedAt)) {
-                        for (const [path, stamp] of watchStamps) {
-                            importStamps.set(path, stamp);
-                        }
-                        cache.set(key, { literal, deps: importStamps });
-                    }
-                }
-                return { start: call.start, end: call.end, literal };
+                cacheWrites.push({
+                    key: p.key,
+                    literal,
+                    importStamps: p.importStamps,
+                    watchDeps: outcome.watchFiles.filter((w) => !hasUriScheme(w)),
+                });
+                return { start: p.call.start, end: p.call.end, literal };
             });
 
-            // All tasks are already running (started by the map above), so awaiting
-            // them one by one keeps the concurrency but makes failure deterministic:
-            // the earliest failing call in source order is the one reported, which is
-            // what a compiler diagnostic should do. Promise.all would instead surface
-            // whichever rejection happened to land first. The no-op handler keeps a
-            // later task rejecting while an earlier one is awaited from being an
-            // unhandled rejection; the rejection is still observed by the await below
-            // when it is the first to fail.
-            // These two loops cannot be merged: the handlers must all be attached
-            // in this synchronous turn, before the first await parks below.
-            for (const t of tasks) t.catch(() => {});
-            const results: Awaited<(typeof tasks)[number]>[] = [];
-            for (const t of tasks) results.push(await t);
+            // Recording each entry needs its watched files to have held still,
+            // concurrently as before. The second check covers writes landing during
+            // the stamping itself, so the stamps and the literal cannot straddle one.
+            await Promise.all(
+                cacheWrites.map(async ({ key, literal, importStamps, watchDeps }) => {
+                    if (!(await allUnmodifiedDuring(watchDeps, startedAt))) return;
+                    const watchStamps = await stampAll(watchDeps);
+                    if (!(await allUnmodifiedDuring(watchDeps, startedAt))) return;
+                    for (const [path, stamp] of watchStamps) importStamps.set(path, stamp);
+                    cache.set(key, { literal, deps: importStamps });
+                }),
+            );
 
-            for (const { start, end, literal } of results) {
-                s.overwrite(start, end, literal);
+            // The earliest failing call in source order is the one reported, which
+            // is what a compiler diagnostic should do.
+            for (const r of resolved) {
+                if ('error' in r) throw r.error;
+            }
+            for (const r of resolved) {
+                if ('error' in r) continue;
+                s.overwrite(r.start, r.end, r.literal);
             }
 
             return {
